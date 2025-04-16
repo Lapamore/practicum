@@ -17,7 +17,7 @@ def get_month_date_range(year, month):
     return start.date(), (end.date())
 
 class ReportServiceServicer(report_pb2_grpc.ReportServiceServicer):
-    def GenerateMonthlyReport(self, request, context):
+    def GenerateMonthlyReport(self, request):
         conn = db.get_conn()
         cur = conn.cursor()
         start_date, end_date = get_month_date_range(request.year, request.month)
@@ -63,7 +63,7 @@ class ReportServiceServicer(report_pb2_grpc.ReportServiceServicer):
             cur.close()
             conn.close()
 
-    def ExportReport(self, request, context):
+    def ExportReport(self, request):
         conn = db.get_conn()
         cur = conn.cursor()
         start_date, end_date = get_month_date_range(request.year, request.month)
