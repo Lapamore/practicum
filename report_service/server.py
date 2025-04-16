@@ -3,7 +3,6 @@ from concurrent import futures
 from report_service import report_pb2
 from report_service import report_pb2_grpc
 from report_service import db
-import psycopg2
 import csv
 import json
 import os
@@ -129,7 +128,7 @@ def serve():
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
     report_pb2_grpc.add_ReportServiceServicer_to_server(ReportServiceServicer(), server)
     server.add_insecure_port('[::]:50053')
-    print("ReportService gRPC server started on port 50053")
+    print("gRPC сервер ReportService запущен на порту 50053")
     server.start()
     server.wait_for_termination()
 

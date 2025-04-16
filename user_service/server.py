@@ -10,7 +10,7 @@ def hash_password(password):
     return hashlib.sha256(password.encode()).hexdigest()
 
 class UserServiceServicer(user_pb2_grpc.UserServiceServicer):
-    def RegisterUser(self, request):
+    def RegisterUser(self, request, context):
         db.init_db()
         conn = db.get_conn()
         cur = conn.cursor()
@@ -29,7 +29,7 @@ class UserServiceServicer(user_pb2_grpc.UserServiceServicer):
             conn.close()
         return user_pb2.RegisterUserResponse(user_id=user_id, status=status)
 
-    def AuthenticateUser(self, request):
+    def AuthenticateUser(self, request, context):
         db.init_db()
         conn = db.get_conn()
         cur = conn.cursor()
@@ -79,7 +79,7 @@ def serve():
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
     user_pb2_grpc.add_UserServiceServicer_to_server(UserServiceServicer(), server)
     server.add_insecure_port('[::]:50051')
-    print("UserService gRPC server started on port 50051")
+    print("gRPC сервер UserService запущен на порту 50051")
     server.start()
     server.wait_for_termination()
 
