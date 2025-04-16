@@ -1,0 +1,42 @@
+syntax = "proto3";
+
+package report_service;
+
+service ReportService {
+  rpc GenerateMonthlyReport (GenerateMonthlyReportRequest) returns (GenerateMonthlyReportResponse);
+  rpc ExportReport (ExportReportRequest) returns (ExportReportResponse);
+}
+
+message GenerateMonthlyReportRequest {
+  string user_id = 1;
+  int32 year = 2;
+  int32 month = 3;
+}
+message CategorySummary {
+  string category = 1;
+  double income = 2;
+  double expense = 3;
+}
+message MonthlyReport {
+  string user_id = 1;
+  int32 year = 2;
+  int32 month = 3;
+  double total_income = 4;
+  double total_expense = 5;
+  double balance = 6;
+  repeated CategorySummary categories = 7;
+}
+message GenerateMonthlyReportResponse {
+  MonthlyReport report = 1;
+}
+
+message ExportReportRequest {
+  string user_id = 1;
+  int32 year = 2;
+  int32 month = 3;
+  string format = 4; // json or csv
+}
+message ExportReportResponse {
+  string file_url = 1;
+  string status = 2;
+}

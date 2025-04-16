@@ -1,0 +1,8 @@
+grpcio
+grpcio-tools
+msgpack
+protobuf
+fastapi
+uvicorn
+pydantic
+psycopg2-binary
