@@ -3,9 +3,9 @@ from psycopg2.extras import RealDictCursor
 import os
 
 DB_CONFIG = {
-    'dbname': os.getenv('POSTGRES_DB', 'report_db'),
+    'dbname': os.getenv('POSTGRES_DB', 'YOUR_DB'),
     'user': os.getenv('POSTGRES_USER', 'postgres'),
-    'password': os.getenv('POSTGRES_PASSWORD', 'ufhybnehf23'),
+    'password': os.getenv('POSTGRES_PASSWORD', 'YOUR_PASSWORD'),
     'host': os.getenv('POSTGRES_HOST', 'localhost'),
     'port': os.getenv('POSTGRES_PORT', '5432'),
 }
@@ -22,7 +22,7 @@ def init_db():
         user_id INTEGER NOT NULL,
         amount DOUBLE PRECISION NOT NULL,
         category VARCHAR(255) NOT NULL,
-        type VARCHAR(20) NOT NULL,
+        tx_type VARCHAR(20) NOT NULL,
         date DATE NOT NULL,
         description TEXT
     );
