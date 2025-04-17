@@ -38,7 +38,7 @@ class UserServiceServicer(user_pb2_grpc.UserServiceServicer):
             row = cur.fetchone()
             if row and row['password_hash'] == hash_password(request.password):
                 user_id = str(row['id'])
-                token = "token123"  # Для простоты, можно реализовать JWT
+                token = "token123"
                 status = "authenticated"
             else:
                 user_id = ""
