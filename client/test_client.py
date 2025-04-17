@@ -2,6 +2,8 @@ import sys
 import os
 import grpc
 import uuid
+import random
+from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
@@ -11,7 +13,6 @@ import transaction_service.transaction_pb2 as transaction_pb2
 import transaction_service.transaction_pb2_grpc as transaction_pb2_grpc
 import report_service.report_pb2 as report_pb2
 import report_service.report_pb2_grpc as report_pb2_grpc
-
 import pytest
 
 @pytest.fixture(scope="module")
@@ -53,9 +54,6 @@ def test_user_service_wrong_password(user_id):
     resp = stub.AuthenticateUser(user_pb2.AuthenticateUserRequest(email=f"test_{uuid.uuid4().hex[:8]}@a.com", password='wrong'))
     print('Аутентификация с неверным паролем:', resp)
     assert resp.status != "authenticated"
-
-import random
-from datetime import datetime, timedelta
 
 def test_transaction_service(user_id):
     channel = grpc.insecure_channel('localhost:50052')
