@@ -113,3 +113,4 @@ report_service/exports/
 # Env files
 .env
 .env.*
+certs
