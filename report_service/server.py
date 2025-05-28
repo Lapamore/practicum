@@ -147,7 +147,9 @@ class ReportServiceServicer(report_pb2_grpc.ReportServiceServicer):
                 start_date=start_date_str,
                 end_date=end_date_str
             )
+            print(f"[{SERVICE_NAME}] Вызов TransactionService.GetTransactions. user_id={request.user_id}. Проброс JWT (начало): {context.auth_token_for_forwarding[:20]}...")
             ts_response = self.transaction_stub.GetTransactions(ts_req, metadata=metadata_for_ts)
+            print(f"[{SERVICE_NAME}] Ответ от TransactionService получен. Количество транзакций: {len(ts_response.transactions)}")
             
             # Обработка ответа от transaction_service
             categories = {}

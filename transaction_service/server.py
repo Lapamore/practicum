@@ -44,40 +44,52 @@ def validate_jwt(func):
 
         token = auth_header.split(' ')[1]
         try:
+            print(f"[{SERVICE_NAME}] Попытка валидации JWT. Токен (начало): {token[:20]}...")
+            print(f"[{SERVICE_NAME}] Ожидаемая аудитория: {JWT_EXPECTED_AUDIENCE_FOR_THIS_SERVICE}, Ожидаемый эмитент: {JWT_EXPECTED_ISSUER}") # Используем новую переменную для аудитории
+            
             payload = jwt.decode(
                 token,
                 self.jwt_public_key,
                 algorithms=JWT_ALGORITHMS,
-                audience=JWT_EXPECTED_AUDIENCE_FOR_THIS_SERVICE,
+                audience=JWT_EXPECTED_AUDIENCE_FOR_THIS_SERVICE, # Используем одну строку
                 issuer=JWT_EXPECTED_ISSUER
             )
-            context.user_id_from_token = payload.get('sub') # Сохраняем user_id из токена
+            context.user_id_from_token = payload.get('sub')
+            context.auth_token_for_forwarding = token # Для report_service
+            print(f"[{SERVICE_NAME}] JWT валиден. Payload sub (user_id): {context.user_id_from_token}, aud: {payload.get('aud')}")
+
             if not context.user_id_from_token:
+                print(f"[{SERVICE_NAME}] Ошибка JWT: отсутствует 'sub' (user_id).")
                 context.abort(grpc.StatusCode.UNAUTHENTICATED, "Token is missing user subject (sub).")
                 return
-
+        # ... (обработка ошибок jwt.ExpiredSignatureError и т.д. с добавлением print) ...
         except jwt.ExpiredSignatureError:
+            print(f"[{SERVICE_NAME}] Ошибка JWT: токен истек.")
             context.abort(grpc.StatusCode.UNAUTHENTICATED, "Token has expired.")
             return
         except jwt.InvalidAudienceError:
+            print(f"[{SERVICE_NAME}] Ошибка JWT: неверная аудитория.")
             context.abort(grpc.StatusCode.UNAUTHENTICATED, "Invalid token audience.")
             return
         except jwt.InvalidIssuerError:
+            print(f"[{SERVICE_NAME}] Ошибка JWT: неверный эмитент.")
             context.abort(grpc.StatusCode.UNAUTHENTICATED, "Invalid token issuer.")
             return
         except jwt.PyJWTError as e:
-            print(f"JWT validation error: {e}")
+            print(f"[{SERVICE_NAME}] Общая ошибка валидации JWT: {e}")
             context.abort(grpc.StatusCode.UNAUTHENTICATED, f"Invalid token.")
             return
         
-        # Авторизация: проверяем, что user_id в запросе совпадает с user_id из токена
-        # Предполагаем, что все запросы к этому сервису содержат поле user_id
+        # Авторизация
         if hasattr(request, 'user_id') and request.user_id != context.user_id_from_token:
+            print(f"[{SERVICE_NAME}] Ошибка авторизации: user_id в запросе ({request.user_id}) не совпадает с user_id в токене ({context.user_id_from_token}).")
             context.abort(grpc.StatusCode.PERMISSION_DENIED,
                           "User ID in request does not match user ID in token.")
             return
-
+        print(f"[{SERVICE_NAME}] Авторизация пройдена для user_id: {context.user_id_from_token}")
+        
         return func(self, request, context)
+    
     return wrapper
 
 
