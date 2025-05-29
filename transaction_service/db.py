@@ -5,7 +5,7 @@ import os
 DB_CONFIG = {
     'dbname': os.getenv('POSTGRES_DB', 'lab5'), # Измени на имя своей БД
     'user': os.getenv('POSTGRES_USER', 'postgres'),
-    'password': os.getenv('POSTGRES_PASSWORD', 'ufhybnehf23'), # Измени на свой пароль
+    'password': os.getenv('POSTGRES_PASSWORD', 'SOSAL?'), # Измени на свой пароль
     'host': os.getenv('POSTGRES_HOST', 'localhost'),
     'port': os.getenv('POSTGRES_PORT', '5432'),
 }
