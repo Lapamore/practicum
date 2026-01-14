@@ -1,12 +1,12 @@
-Отлично! Давай встроим этот пайплайн (TreePipeline) в инструмент вызова поддержки (CallSupportTool).
+Понял. Значит, логика следующая:
 
-Суть изменения: вместо старой простой классификации мы будем запускать твой новый TreePipeline. Он вернет контекст, в котором может быть:
+Сценарий "Комментарий": Если AI понял, что это шаблонный вопрос (Бизнес-план, Прогноз), он отдает текст и не ставит в очередь. Диалог закрывается/остается на AI.
+Сценарий "Роутинг": Если AI нашел group_ids (список конкретных ID сотрудников), он ставит диалог в очередь, привязывая его к этому списку.
+Фильтрация: Когда сотрудник заходит в интерфейс ("Ожидающие диалоги"), он должен видеть только те диалоги, в списке group_ids которых есть его ID.
+Давай реализуем это. Нам нужно протащить этот список ID от CallSupportTool через сервис в репозиторий, а потом использовать его для фильтрации при выдаче.
 
-comment — это шаблонный ответ (например, ссылка на СберДруг). В этом случае мы просто отдаем текст пользователю и не зовем оператора.
-group_code (или group_ids) — мы нашли конкретную очередь. Мы преобразуем код в ID (если нужно) и автоматически ставим пользователя в очередь.
-Ничего — если не удалось определить, отправляем пользователя в ручной выбор (CHOOSING_GROUP).
-Шаг 1: Обновляем CallSupportTool.py
-Нам нужно внедрить TreePipeline и IRoutingRepository (для преобразования кодов в ID групп). Также нам понадобится история диалога в формате LangChain, чтобы передать её в пайплайн.
+1. Обновляем CallSupportTool.py
+Здесь мы запускаем пайплайн. Если вернулся комментарий — отдаем его. Если вернулись ID — зовем сервис с передачей этих ID.
 
 Файл: src/components/tools/impl/CallSupportTool.py
 
@@ -38,9 +38,7 @@ __all__ = ["CallSupportTool"]
 
 class CallSupportTool(BaseTool):
     name: str = "/support"
-    description: str = (
-        "Функция, позволяющая вызвать сотрудника сопровождения."
-    )
+    description: str = "Функция, позволяющая вызвать сотрудника сопровождения."
 
     cache: ICache
     agent_service: IAgentService
@@ -57,18 +55,17 @@ class CallSupportTool(BaseTool):
         if not dialog_id or not user_id:
             return "Ошибка: Не удалось определить ID диалога."
 
-        # 1. Проверка текущего статуса (чтобы не дублировать вызовы)
+        # 1. Проверяем, не в очереди ли уже
         current_state = await self.cache.get(f"dialog:{dialog_id}:state")
         if current_state and current_state not in [DialogState.AI_HANDLED.value, None]:
             return "Процесс вызова сотрудника уже инициирован."
 
-        # 2. Получаем историю диалога для пайплайна
+        # 2. Получаем историю и готовим контекст
         raw_history = await self.agent_service.get_dialog_history(user_id=user_id, session_id=dialog_id)
-        # Преобразуем историю в формат LangChain для пайплайна
         langchain_history = []
         for msg in raw_history:
-            content = msg.get("content", "")
             role = msg.get("role", "")
+            content = msg.get("content", "")
             if role == "user":
                 langchain_history.append(HumanMessage(content=content))
             elif role == "system":
@@ -76,25 +73,28 @@ class CallSupportTool(BaseTool):
             else:
                 langchain_history.append(AIMessage(content=content))
 
-        # 3. Запускаем TreePipeline для определения маршрута
         tree_context = TreeRequestContext(history=langchain_history)
+
+        # 3. Запускаем Pipeline классификации
         try:
             result_context = await self.tree_pipeline.execute(tree_context)
         except Exception as e:
-            logger.error(f"TreePipeline execution failed: {e}")
-            result_context = tree_context # Fallback к пустому контексту
+            logger.error(f"TreePipeline error: {e}")
+            result_context = tree_context
 
-        # --- СЦЕНАРИЙ А: Шаблонный ответ (Comment) ---
-        # Пайплайн определил, что это стандартный запрос (бизнес-план, прогноз и т.д.)
-        # Оператор НЕ нужен.
+        # --- СЦЕНАРИЙ 1: Есть комментарий (Шаблонный ответ) ---
+        # Мы НЕ ставим в очередь, просто отдаем ответ пользователю.
         if result_context.comment:
-            return result_context.comment
+            return (
+                result_context.comment,  # Текст ответа
+                DialogState.AI_HANDLED.value # Статус остается на AI
+            )
 
-        # --- СЦЕНАРИЙ Б: Найдена конкретная группа (Auto-Join) ---
+        # --- СЦЕНАРИЙ 2: Есть список ID сотрудников (Роутинг) ---
         group_ids = result_context.group_ids
         group_code = result_context.group_code
         
-        # Если пайплайн вернул код, но не ID, резолвим код через репозиторий
+        # Если пайплайн вернул код, но не ID (например, на шаге SelectTheme), резолвим через репозиторий
         if not group_ids and group_code:
             try:
                 group_ids = await self.routing_repo.get_working_group_ids(group_code)
@@ -102,64 +102,52 @@ class CallSupportTool(BaseTool):
                 logger.error(f"Failed to resolve group_code {group_code}: {e}")
 
         if group_ids:
-            # Превращаем список ID в строку (как ожидает текущая реализация agent_service)
-            # Или берем первый ID, если логика распределения простая. 
-            # Допустим, agent_service ожидает строковый group_id.
-            # Если ваша система поддерживает балансировку, передавайте нужный ID.
-            # Для примера берем первый или сам код, если agent_service умеет работать с кодами.
-            target_group_id = str(group_ids[0]) if isinstance(group_ids, list) and group_ids else str(group_ids)
-            
             try:
-                await self.agent_service.join_support_queue(
+                # Преобразуем к списку строк или int, как удобнее. 
+                # Допустим, ids приходят int, но храним как есть.
+                target_ids = list(group_ids)
+                
+                # Вызываем новый метод с передачей списка ID
+                await self.agent_service.join_support_queue_with_ids(
                     dialog_id=dialog_id,
                     user_id=user_id,
-                    group_id=target_group_id
+                    target_agent_ids=target_ids,
+                    group_code=group_code or "manual_routing"
                 )
                 
-                route_name = result_context.product_category or result_context.product_group or "Специализированная группа"
-                
+                product_name = result_context.product_category or "специализированную группу"
                 return (
-                    f"Я перевел ваш диалог на группу «{route_name}». Ожидайте подключения оператора.",
+                    f"Я перевел ваш диалог на группу «{product_name}». Ожидайте подключения оператора.",
                     DialogState.AWAITING_AGENT.value
                 )
             except Exception as e:
-                logger.error(f"Error auto-joining queue: {e}")
-                # Если упало, идем в Fallback
+                logger.error(f"Error auto-joining queue with IDs: {e}")
+                # Fallback если не получилось
 
-        # --- СЦЕНАРИЙ В: Fallback (Ручной выбор) ---
-        # Пайплайн не нашел точного маршрута -> просим пользователя выбрать тему.
+        # --- СЦЕНАРИЙ 3: Fallback (Ручной выбор) ---
+        # Если не определили ни комментарий, ни группу -> отправляем в ручной выбор
         try:
-            await self.agent_service.change_dialog_group(dialog_id, "general") # Сброс на General перед выбором?
-            
-            # Устанавливаем статус CHOOSING_GROUP
-            # Важно: это делается через репозиторий внутри tool, но лучше через сервис, 
-            # однако agent_service.join_support_queue ставит AWAITING_AGENT.
-            # Нам нужно именно состояние выбора.
-            
-            # Поскольку у нас нет метода set_status в IAgentService (есть только join),
-            # мы используем cache напрямую, как в оригинале, или добавляем метод в сервис.
-            # В оригинале tool имел доступ к dialog_repo.
-            
-            # Обновляем статус в Redis, чтобы фронт отрисовал меню
+            # Тут ставим статус CHOOSING_GROUP, чтобы фронт показал меню
             await self.cache.set(f"dialog:{dialog_id}:state", DialogState.CHOOSING_GROUP.value)
             
-            # Логируем смену статуса в SQL через сервис не получится напрямую, если там нет метода set_status_raw.
-            # Но у нас есть self.agent_service. В оригинале Tool имел dialog_repo.
-            # Допустим, мы просто возвращаем статус, а pipeline Step обновит его?
-            # Нет, Tool возвращает tuple (текст, статус).
-            
+            # Логируем в SQL как "AI перевел на выбор"
+            await self.agent_service._dialog.set_status(
+                dialog_id, user_id, 
+                DialogState.CHOOSING_GROUP.value, 
+                "AI"
+            )
         except Exception as e:
-            logger.error(f"Error preparing manual selection: {e}")
-            return "Произошла ошибка при вызове меню поддержки."
+            logger.error(f"Error setting manual selection state: {e}")
+            return "Произошла ошибка."
 
         return (
             "Я не смог точно определить категорию вопроса. Пожалуйста, выберите тему вручную.",
             DialogState.CHOOSING_GROUP.value
         )
-Шаг 2: Обновляем ToolsProvider.py
-Теперь нужно прокинуть зависимости (TreePipeline и RoutingRepository) в CallSupportTool.
+2. Обновляем IAgentService и AgentService
+Нужно добавить метод для постановки в очередь с конкретными ID и обновить метод получения диалогов, чтобы он фильтровал выдачу.
 
-Файл: src/components/tools/di/ToolsProvider.py
+Файл: src/components/agent_service/infractructure/services/core/IAgentService.py
 
 code
 Python
@@ -169,60 +157,231 @@ download
 content_copy
 
 expand_less
+# ... внутри класса IAgentService ...
+
+    @abstractmethod
+    async def join_support_queue_with_ids(
+        self, 
+        dialog_id: str, 
+        user_id: str, 
+        target_agent_ids: List[int],
+        group_code: str
+    ) -> None:
+        """Поставить в очередь, видимую только конкретным агентам"""
+        raise NotImplementedError
+
+    @abstractmethod
+    async def get_awaiting_dialogs(self, requesting_agent_id: str) -> List[DialogModel]:
+        """Получить диалоги, доступные конкретному агенту"""
+        raise NotImplementedError
+Файл: src/components/agent_service/infractructure/services/impl/AgentService.py
+
+code
+Python
+
+download
+
+content_copy
+
+expand_less
+# ... внутри класса AgentService ...
+
+    async def join_support_queue_with_ids(
+        self, 
+        dialog_id: str, 
+        user_id: str, 
+        target_agent_ids: List[int],
+        group_code: str
+    ) -> None:
+        # 1. Сохраняем метаданные (код группы) в кеш, пригодится для статистики
+        await self._cache.set_work_group(dialog_id, group_code)
+        
+        # 2. Логируем статус в SQL
+        await self._dialog.set_status(
+            dialog_id, user_id, 
+            DialogState.AWAITING_AGENT.value, 
+            "AI_ROUTER"
+        )
+        
+        # 3. Обновляем статус в Redis
+        await self._cache.set_state(dialog_id, DialogState.AWAITING_AGENT.value)
+        
+        # 4. Добавляем в очередь с указанием разрешенных ID
+        await self._queue.add_to_queue_targeted(dialog_id, user_id, target_agent_ids)
+
+
+    async def get_awaiting_dialogs(self, requesting_agent_id: str) -> List[DialogModel]:
+        # Передаем ID запрашивающего агента в репозиторий для фильтрации
+        return await self._queue.get_awaiting_dialogs(requesting_agent_id)
+3. Обновляем Репозиторий Очереди (DialogQueueRepository)
+Здесь происходит магия фильтрации. Мы храним список ID в payload и проверяем его при чтении.
+
+Файл: src/components/agent_service/infractructure/repositories/core/IDialogQueueRepository.py
+
+code
+Python
+
+download
+
+content_copy
+
+expand_less
+@abstractmethod
+    async def add_to_queue_targeted(self, dialog_id: str, user_id: str, allowed_ids: List[int]) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def get_awaiting_dialogs(self, requesting_agent_id: Optional[str] = None) -> List[DialogModel]:
+        # Обновили сигнатуру: добавили requesting_agent_id
+        raise NotImplementedError
+Файл: src/components/agent_service/infractructure/repositories/impl/DialogQueueRepository.py
+
+code
+Python
+
+download
+
+content_copy
+
+expand_less
+import json
+import logging
 from typing import List, Optional
 
-from langchain_core.tools import BaseTool
-from dishka import Provider, provide, Scope
-
-from ..impl import CallSupportTool
-from ...routing.infrastructure.ai_pipeline.base import TreePipeline
-from ...routing.infrastructure.repositories.core import IRoutingRepository
+from ..core import IDialogQueueRepository
+from ....models import DialogModel
 from mbi.copilot.src.infrastructure.keydb.core import ICache
+
+__all__ = ["DialogQueueRepository"]
+
+logger = logging.getLogger(__name__)
+
+
+class DialogQueueRepository(IDialogQueueRepository):
+
+    QUEUE_KEY = "dialogs:awaiting_agent_queue"
+
+    def __init__(self, cache: ICache):
+        self._cache = cache
+
+    async def add_to_queue_targeted(self, dialog_id: str, user_id: str, allowed_ids: List[int]) -> None:
+        payload = json.dumps({
+            "dialog_id": dialog_id,
+            "user_id": user_id,
+            "allowed_ids": allowed_ids,  # Сохраняем список ID
+            "timestamp": "..." # Можно добавить время добавления
+        })
+        await self._cache.rpush(self.QUEUE_KEY, [payload])
+        logger.info(f"Dialog {dialog_id} added to queue for agents: {allowed_ids}")
+
+    # Старый метод (для совместимости или fallback)
+    async def add_to_queue(self, dialog_id: str, user_id: str, group_id: str) -> None:
+        # Если используется старый метод, считаем что group_id это просто маркер,
+        # но лучше перевести всё на targeted. Или сохранять group_id как allowed_ids=[group_id]
+        payload = json.dumps({
+            "dialog_id": dialog_id,
+            "user_id": user_id,
+            "legacy_group": group_id 
+        })
+        await self._cache.rpush(self.QUEUE_KEY, [payload])
+
+    async def get_awaiting_dialogs(self, requesting_agent_id: Optional[str] = None) -> List[DialogModel]:
+        payloads = await self._cache.lrange(self.QUEUE_KEY, 0, -1)
+        dialogs = []
+        
+        # Приводим requesting_agent_id к int для сравнения, если он числовой
+        req_id_int = None
+        if requesting_agent_id and requesting_agent_id.isdigit():
+            req_id_int = int(requesting_agent_id)
+
+        for payload_str in payloads:
+            try:
+                if isinstance(payload_str, bytes):
+                    payload_str = payload_str.decode()
+                item = json.loads(payload_str)
+                
+                # === ЛОГИКА ФИЛЬТРАЦИИ ===
+                allowed_ids = item.get("allowed_ids") # Список [22861759, ...]
+                
+                is_visible = False
+                
+                if allowed_ids:
+                    # Это диалог с таргетингом
+                    if requesting_agent_id:
+                        # Проверяем, есть ли наш агент в списке (как int или str)
+                        if (req_id_int in allowed_ids) or (requesting_agent_id in allowed_ids) or (str(req_id_int) in [str(x) for x in allowed_ids]):
+                            is_visible = True
+                    else:
+                        # Если ID не передан (админский просмотр?), показываем всё или ничего (зависит от бизнес-логики)
+                        is_visible = True 
+                else:
+                    # Это старый диалог или диалог "для всех" (fallback)
+                    # Если нужно показывать такие диалоги всем - True
+                    # Если только для general группы - проверка legacy_group
+                    is_visible = True
+
+                if is_visible:
+                    dialogs.append(DialogModel(
+                        id=item["dialog_id"],
+                        userId=item["user_id"],
+                        # workGroupId больше не является единственным идентификатором,
+                        # но можно отдать метку для фронта
+                        workGroupId="targeted" if allowed_ids else item.get("legacy_group", "general")
+                    ))
+                    
+            except (json.JSONDecodeError, TypeError, KeyError) as e:
+                logger.error(f"Queue parse error: {e}")
+
+        return dialogs
+
+    # Остальные методы (remove, update) нужно обновить, чтобы они искали по dialog_id внутри JSON
+    # так как структура JSON изменилась
+4. Обновляем Хендлер (GetAwaitingDialogsHandler)
+Теперь хендлер должен вытаскивать agent_id из параметров запроса (которые приходят от фронта) и передавать их в сервис.
+
+Файл: src/web/routing/handlers/get/GetAwaitingDialogsHandler.py
+
+code
+Python
+
+download
+
+content_copy
+
+expand_less
+from typing import List, Dict
+from ....models.request import AgentIdRequest # Предполагаем, что есть Request с agent_id, или используем Dict
+from mbi.copilot.src.components.agent_service.models import DialogModel
 from mbi.copilot.src.components.agent_service.infractructure.services.core import IAgentService
 
-__all__ = ["ToolsProvider"]
+__all__ = ["GetAwaitingDialogsHandler"]
 
 
-class ToolsProvider(Provider):
+class GetAwaitingDialogsHandler:
+    action_name: str = "get_awaiting_dialogs"
 
-    @provide(scope=Scope.REQUEST)
-    def get_tools(
-        self, 
-        cache: ICache, 
-        agent_service: IAgentService,
-        tree_pipeline: TreePipeline,       # <--- Новая зависимость
-        routing_repo: IRoutingRepository   # <--- Новая зависимость
-    ) -> Optional[List[BaseTool]]:
-        return [
-            CallSupportTool(
-                cache=cache, 
-                agent_service=agent_service,
-                tree_pipeline=tree_pipeline,
-                routing_repo=routing_repo
-            )
-        ]
-Разбор логики работы
-Пользователь пишет: "У меня проблема с бизнес-планом в управленческом кубе".
-ToolSelectorStep (из основного пайплайна) понимает, что нужен саппорт или ответ сложный, и вызывает CallSupportTool.
-CallSupportTool:
-Берет историю.
-Запускает TreePipeline.
-TreePipeline проходит шаги:
-SelectProductGroupMis -> выбирает "MIS".
-SelectProductStep -> выбирает "Управленческий куб".
-SelectApplicationScope -> выбирает "Управленческий куб – Бизнес-план".
-Возвращает TreeRequestContext(comment="Для получения консультации...", should_stop=True).
-Результат: CallSupportTool видит поле comment, возвращает этот текст. Статус диалога не меняется на "Ожидание оператора". Пользователь получает справку мгновенно.
-Пример 2 (Авто-роутинг):
+    def __init__(self, agent_service: IAgentService) -> None:
+        self._agent_service = agent_service
 
-Пользователь пишет: "Не работает куб по кредитам ЮЛ".
-TreePipeline:
-...
-SelectB2BMis -> находит "Куб данных по кредитам юр.лиц".
-Возвращает TreeRequestContext(group_code="M0009").
-CallSupportTool:
-Видит group_code="M0009".
-Идет в RoutingRepository, получает ids=[105, 106].
-Вызывает agent_service.join_support_queue(..., group_id="105").
-Отвечает пользователю: "Перевожу на группу Куб данных по кредитам юр.лиц...".
-Это полностью закрывает задачу встраивания технологии в процесс вызова сотрудника.
+    async def handle(self, params: Dict) -> Dict[str, List[Dict]]:
+        # Пытаемся достать agent_id. 
+        # Если фронт его не шлет, фильтрация не сработает (или вернет всё/ничего, как настроим в Repo).
+        agent_id = params.get("agent_id")
+        
+        if not agent_id and "params" in params:
+             agent_id = params["params"].get("agent_id")
+
+        awaiting_dialogs = await self._agent_service.get_awaiting_dialogs(
+            requesting_agent_id=str(agent_id) if agent_id else None
+        )
+        
+        return {"dialogs": [d.model_dump() for d in awaiting_dialogs]}
+Итог:
+
+AI (Tool) определяет список ID ([123, 456]).
+Service кладет в Redis JSON: {"allowed_ids": [123, 456], ...}.
+Сотрудник 123 делает запрос get_awaiting_dialogs(agent_id=123).
+Repo видит 123 в allowed_ids и отдает диалог.
+Сотрудник 999 делает запрос get_awaiting_dialogs(agent_id=999).
+Repo не видит 999 в списке и не отдает диалог.
+Все требования соблюдены.
