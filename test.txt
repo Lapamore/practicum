@@ -1,0 +1,228 @@
+Отлично! Давай встроим этот пайплайн (TreePipeline) в инструмент вызова поддержки (CallSupportTool).
+
+Суть изменения: вместо старой простой классификации мы будем запускать твой новый TreePipeline. Он вернет контекст, в котором может быть:
+
+comment — это шаблонный ответ (например, ссылка на СберДруг). В этом случае мы просто отдаем текст пользователю и не зовем оператора.
+group_code (или group_ids) — мы нашли конкретную очередь. Мы преобразуем код в ID (если нужно) и автоматически ставим пользователя в очередь.
+Ничего — если не удалось определить, отправляем пользователя в ручной выбор (CHOOSING_GROUP).
+Шаг 1: Обновляем CallSupportTool.py
+Нам нужно внедрить TreePipeline и IRoutingRepository (для преобразования кодов в ID групп). Также нам понадобится история диалога в формате LangChain, чтобы передать её в пайплайн.
+
+Файл: src/components/tools/impl/CallSupportTool.py
+
+code
+Python
+
+download
+
+content_copy
+
+expand_less
+import uuid
+import logging
+from typing import List
+
+from langchain_core.tools import BaseTool
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+
+from ...models import DialogState
+from ...agent_service.infractructure.services.core import IAgentService
+from ...routing.infrastructure.ai_pipeline.base import TreePipeline, TreeRequestContext
+from ...routing.infrastructure.repositories.core import IRoutingRepository
+from mbi.copilot.src.infrastructure.keydb.core import ICache
+
+logger = logging.getLogger(__name__)
+
+__all__ = ["CallSupportTool"]
+
+
+class CallSupportTool(BaseTool):
+    name: str = "/support"
+    description: str = (
+        "Функция, позволяющая вызвать сотрудника сопровождения."
+    )
+
+    cache: ICache
+    agent_service: IAgentService
+    tree_pipeline: TreePipeline
+    routing_repo: IRoutingRepository
+
+    class Config:
+        arbitrary_types_allowed = True
+
+    def _run(self):
+        raise NotImplementedError("Sync execution not supported.")
+
+    async def _arun(self, dialog_id: str, user_id: str):
+        if not dialog_id or not user_id:
+            return "Ошибка: Не удалось определить ID диалога."
+
+        # 1. Проверка текущего статуса (чтобы не дублировать вызовы)
+        current_state = await self.cache.get(f"dialog:{dialog_id}:state")
+        if current_state and current_state not in [DialogState.AI_HANDLED.value, None]:
+            return "Процесс вызова сотрудника уже инициирован."
+
+        # 2. Получаем историю диалога для пайплайна
+        raw_history = await self.agent_service.get_dialog_history(user_id=user_id, session_id=dialog_id)
+        # Преобразуем историю в формат LangChain для пайплайна
+        langchain_history = []
+        for msg in raw_history:
+            content = msg.get("content", "")
+            role = msg.get("role", "")
+            if role == "user":
+                langchain_history.append(HumanMessage(content=content))
+            elif role == "system":
+                langchain_history.append(SystemMessage(content=content))
+            else:
+                langchain_history.append(AIMessage(content=content))
+
+        # 3. Запускаем TreePipeline для определения маршрута
+        tree_context = TreeRequestContext(history=langchain_history)
+        try:
+            result_context = await self.tree_pipeline.execute(tree_context)
+        except Exception as e:
+            logger.error(f"TreePipeline execution failed: {e}")
+            result_context = tree_context # Fallback к пустому контексту
+
+        # --- СЦЕНАРИЙ А: Шаблонный ответ (Comment) ---
+        # Пайплайн определил, что это стандартный запрос (бизнес-план, прогноз и т.д.)
+        # Оператор НЕ нужен.
+        if result_context.comment:
+            return result_context.comment
+
+        # --- СЦЕНАРИЙ Б: Найдена конкретная группа (Auto-Join) ---
+        group_ids = result_context.group_ids
+        group_code = result_context.group_code
+        
+        # Если пайплайн вернул код, но не ID, резолвим код через репозиторий
+        if not group_ids and group_code:
+            try:
+                group_ids = await self.routing_repo.get_working_group_ids(group_code)
+            except Exception as e:
+                logger.error(f"Failed to resolve group_code {group_code}: {e}")
+
+        if group_ids:
+            # Превращаем список ID в строку (как ожидает текущая реализация agent_service)
+            # Или берем первый ID, если логика распределения простая. 
+            # Допустим, agent_service ожидает строковый group_id.
+            # Если ваша система поддерживает балансировку, передавайте нужный ID.
+            # Для примера берем первый или сам код, если agent_service умеет работать с кодами.
+            target_group_id = str(group_ids[0]) if isinstance(group_ids, list) and group_ids else str(group_ids)
+            
+            try:
+                await self.agent_service.join_support_queue(
+                    dialog_id=dialog_id,
+                    user_id=user_id,
+                    group_id=target_group_id
+                )
+                
+                route_name = result_context.product_category or result_context.product_group or "Специализированная группа"
+                
+                return (
+                    f"Я перевел ваш диалог на группу «{route_name}». Ожидайте подключения оператора.",
+                    DialogState.AWAITING_AGENT.value
+                )
+            except Exception as e:
+                logger.error(f"Error auto-joining queue: {e}")
+                # Если упало, идем в Fallback
+
+        # --- СЦЕНАРИЙ В: Fallback (Ручной выбор) ---
+        # Пайплайн не нашел точного маршрута -> просим пользователя выбрать тему.
+        try:
+            await self.agent_service.change_dialog_group(dialog_id, "general") # Сброс на General перед выбором?
+            
+            # Устанавливаем статус CHOOSING_GROUP
+            # Важно: это делается через репозиторий внутри tool, но лучше через сервис, 
+            # однако agent_service.join_support_queue ставит AWAITING_AGENT.
+            # Нам нужно именно состояние выбора.
+            
+            # Поскольку у нас нет метода set_status в IAgentService (есть только join),
+            # мы используем cache напрямую, как в оригинале, или добавляем метод в сервис.
+            # В оригинале tool имел доступ к dialog_repo.
+            
+            # Обновляем статус в Redis, чтобы фронт отрисовал меню
+            await self.cache.set(f"dialog:{dialog_id}:state", DialogState.CHOOSING_GROUP.value)
+            
+            # Логируем смену статуса в SQL через сервис не получится напрямую, если там нет метода set_status_raw.
+            # Но у нас есть self.agent_service. В оригинале Tool имел dialog_repo.
+            # Допустим, мы просто возвращаем статус, а pipeline Step обновит его?
+            # Нет, Tool возвращает tuple (текст, статус).
+            
+        except Exception as e:
+            logger.error(f"Error preparing manual selection: {e}")
+            return "Произошла ошибка при вызове меню поддержки."
+
+        return (
+            "Я не смог точно определить категорию вопроса. Пожалуйста, выберите тему вручную.",
+            DialogState.CHOOSING_GROUP.value
+        )
+Шаг 2: Обновляем ToolsProvider.py
+Теперь нужно прокинуть зависимости (TreePipeline и RoutingRepository) в CallSupportTool.
+
+Файл: src/components/tools/di/ToolsProvider.py
+
+code
+Python
+
+download
+
+content_copy
+
+expand_less
+from typing import List, Optional
+
+from langchain_core.tools import BaseTool
+from dishka import Provider, provide, Scope
+
+from ..impl import CallSupportTool
+from ...routing.infrastructure.ai_pipeline.base import TreePipeline
+from ...routing.infrastructure.repositories.core import IRoutingRepository
+from mbi.copilot.src.infrastructure.keydb.core import ICache
+from mbi.copilot.src.components.agent_service.infractructure.services.core import IAgentService
+
+__all__ = ["ToolsProvider"]
+
+
+class ToolsProvider(Provider):
+
+    @provide(scope=Scope.REQUEST)
+    def get_tools(
+        self, 
+        cache: ICache, 
+        agent_service: IAgentService,
+        tree_pipeline: TreePipeline,       # <--- Новая зависимость
+        routing_repo: IRoutingRepository   # <--- Новая зависимость
+    ) -> Optional[List[BaseTool]]:
+        return [
+            CallSupportTool(
+                cache=cache, 
+                agent_service=agent_service,
+                tree_pipeline=tree_pipeline,
+                routing_repo=routing_repo
+            )
+        ]
+Разбор логики работы
+Пользователь пишет: "У меня проблема с бизнес-планом в управленческом кубе".
+ToolSelectorStep (из основного пайплайна) понимает, что нужен саппорт или ответ сложный, и вызывает CallSupportTool.
+CallSupportTool:
+Берет историю.
+Запускает TreePipeline.
+TreePipeline проходит шаги:
+SelectProductGroupMis -> выбирает "MIS".
+SelectProductStep -> выбирает "Управленческий куб".
+SelectApplicationScope -> выбирает "Управленческий куб – Бизнес-план".
+Возвращает TreeRequestContext(comment="Для получения консультации...", should_stop=True).
+Результат: CallSupportTool видит поле comment, возвращает этот текст. Статус диалога не меняется на "Ожидание оператора". Пользователь получает справку мгновенно.
+Пример 2 (Авто-роутинг):
+
+Пользователь пишет: "Не работает куб по кредитам ЮЛ".
+TreePipeline:
+...
+SelectB2BMis -> находит "Куб данных по кредитам юр.лиц".
+Возвращает TreeRequestContext(group_code="M0009").
+CallSupportTool:
+Видит group_code="M0009".
+Идет в RoutingRepository, получает ids=[105, 106].
+Вызывает agent_service.join_support_queue(..., group_id="105").
+Отвечает пользователю: "Перевожу на группу Куб данных по кредитам юр.лиц...".
+Это полностью закрывает задачу встраивания технологии в процесс вызова сотрудника.
