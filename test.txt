@@ -1,20 +1,10 @@
-Нет, удалять пока нельзя, но мы сейчас сделаем так, чтобы можно было удалить.
+Вот полные файлы с реализованной логикой переключения групп (трансфера) и таргетированной очереди.
 
-В чем подвох?
-У тебя есть два пути, как диалог попадает в очередь:
+1. src/components/agent_service/infractructure/services/impl/AgentService.py
+Что изменилось:
 
-AI (автоматически): Использует новый метод join_targeted_support -> add_to_queue_targeted.
-Ручной выбор (через модалку): Использует старый метод join_support_queue -> add_to_queue.
-Если ты сейчас удалишь add_to_queue, сломается ручной выбор (когда пользователь сам тыкает "ФОТ" или "IT").
-
-Как сделать правильно (Унификация)
-Давай обновим старый метод join_support_queue в AgentService, чтобы он тоже искал ID сотрудников и использовал новую логику. Тогда старый метод в репозитории станет не нужен.
-
-Шаг 1. Обновляем AgentService.py
-Мы переписываем join_support_queue (ручной выбор), чтобы он работал через RoutingRepository и новый add_to_queue_targeted.
-
-Файл: src/components/agent_service/infractructure/services/impl/AgentService.py
-
+change_dialog_group: Теперь это не просто смена метки. Он ищет IDs сотрудников новой группы. Если диалог в очереди — обновляет права доступа (update_queue_targeting). Если диалог у агента — отбирает его (release_dialog) и возвращает в очередь к новым сотрудникам.
+join_support_queue: (Ручной выбор) Теперь тоже ходит в базу за ID сотрудников, чтобы очередь была таргетированной.
 code
 Python
 
@@ -23,58 +13,438 @@ download
 content_copy
 
 expand_less
-# ... внутри AgentService ...
+import uuid
+import logging
+from typing import Any, Dict, List, Optional
+
+from ..core import IAgentService
+from ...repositories.core import (
+    IDialogRepository,
+    IDialogCacheRepository,
+    IDialogQueueRepository,
+    IMessageRepository,
+    IStatisticsRepository,
+)
+from ....models import DialogModel, MessageModel, PolledMessage, MessageRole
+from mbi.copilot.src.components.models import DialogState
+from mbi.copilot.src.web.models.response import (
+    StatisticsResponse,
+    ClaimDialogResponse,
+    DialogDetailsResponse,
+    GetMessagesResponse,
+    StatusResponse,
+)
+
+from mbi.copilot.src.components.routing.infrastructure.repositories.core import IRoutingRepository
+
+__all__ = ["AgentService"]
+
+logger = logging.getLogger(__name__)
+
+
+class AgentService(IAgentService):
+    def __init__(
+        self,
+        dialog_repo: IDialogRepository,
+        cache_repo: IDialogCacheRepository,
+        queue_repo: IDialogQueueRepository,
+        msg_repo:  IMessageRepository,
+        stats_repo:  IStatisticsRepository,
+        routing_repo: IRoutingRepository
+    ):
+        self._dialog = dialog_repo
+        self._cache = cache_repo
+        self._queue = queue_repo
+        self._msg = msg_repo
+        self._stats = stats_repo
+        self._routing_repo = routing_repo
+
+    # === Статистика ===
+
+    async def get_statistics(self) -> StatisticsResponse: 
+        return await self._stats.get_statistics()
+
+    async def rate_dialog(
+        self, 
+        dialog_id: str, 
+        user_id:  str, 
+        rating: str, 
+        comment: str = None, 
+        is_resolved: bool = None
+    ) -> StatusResponse:
+        if rating not in ["like", "dislike"]:
+            raise ValueError("Rating must be 'like' or 'dislike'")
+        await self._stats.log_rating(dialog_id, user_id, rating, comment, is_resolved)
+        return StatusResponse(status="rating_recorded")
+
+    # === Очередь и получение диалогов ===
+
+    async def get_awaiting_dialogs(self, requesting_agent_id: str = None) -> List[DialogModel]:
+        if not requesting_agent_id:
+            return []
+        return await self._queue.get_awaiting_dialogs(requesting_agent_id)
+    
+    async def get_my_active_dialogs(self, agent_id: str) -> List[Dict]: 
+        dialogs = await self._dialog.get_active_agent_dialogs(agent_id)
+        result = []
+        for d in dialogs: 
+            dialog_dict = d.model_dump() if hasattr(d, 'model_dump') else d
+            group = await self._cache.get_work_group(dialog_dict["id"])
+            if group:
+                dialog_dict["workGroupId"] = group
+            result.append(dialog_dict)
+        return result
+
+    async def get_finished_dialogs(self, agent_id:  str) -> List[Dict]:
+        dialogs = await self._dialog.get_finished_dialogs(agent_id)
+        return [d.model_dump() if hasattr(d, 'model_dump') else d for d in dialogs]
+
+    async def get_user_dialogs(self, user_id:  str) -> List[Dict[str, Any]]: 
+        return await self._dialog.get_user_dialogs(uuid.UUID(user_id))
+
+    # === Подключение к поддержке ===
+
+    async def join_targeted_support(
+        self, 
+        dialog_id: str, 
+        user_id: str, 
+        target_agent_ids: List[int],
+        group_display_name: str
+    ) -> Dict[str, str]:
+        """Автоматическое добавление AI с известными ID"""
+        await self._cache.set_work_group(dialog_id, group_display_name)
+        
+        await self._dialog.set_status(
+            dialog_id, user_id, 
+            DialogState.AWAITING_AGENT.value, 
+            "AI_ROUTER"
+        )
+        
+        await self._cache.set_state(dialog_id, DialogState.AWAITING_AGENT.value, ttl=None)
+        
+        await self._queue.add_to_queue(
+            dialog_id=dialog_id, 
+            user_id=user_id, 
+            allowed_agent_ids=target_agent_ids,
+            display_group_name=group_display_name
+        )
+        
+        return {"status": "ok", "message": "Queued for specific agents"}
 
     async def join_support_queue(
         self, 
         dialog_id: str, 
         user_id: str, 
-        group_id: str # Приходит от фронта: 'payroll', 'it_support' и т.д.
+        group_id: str
     ) -> Dict[str, str]:
+        """Ручное добавление пользователем (ищем ID по группе)"""
         
-        # 1. Пытаемся найти ID сотрудников для выбранной группы
-        # group_id здесь выступает как group_code
-        target_ids = await self._routing.get_working_group_ids(group_id)
+        # 1. Получаем ID сотрудников для выбранной группы
+        target_ids = await self._routing_repo.get_working_group_ids(group_id)
         
-        # Если для этой группы в базе нет сотрудников (или это 'general'),
-        # можно либо кинуть ошибку, либо отправить в "общую кучу" (пустой список ID)
+        # Fallback, если группа не найдена (например, general)
         if not target_ids:
-            # Fallback: если ID не найдены, список пустой (зависит от твоей логики фильтрации:
-            # пустой список = видят все ИЛИ видят только админы).
-            # Допустим, если не нашли, пробуем найти для 'general'
-            target_ids = await self._routing.get_working_group_ids('general') or []
+             target_ids = await self._routing_repo.get_working_group_ids("general") or []
 
-        # Преобразуем в строки для надежности (если в базе int)
-        target_ids_str = [str(x) for x in target_ids]
-
-        # 2. Сохраняем метаданные
         await self._cache.set_work_group(dialog_id, group_id)
         
-        # 3. Логируем статус
         await self._dialog.set_status(
             dialog_id, user_id, 
             DialogState.AWAITING_AGENT.value, 
             "USER_MANUAL"
         )
         
-        # 4. Кеш статуса
-        await self._cache.set_state(dialog_id, DialogState.AWAITING_AGENT.value)
+        await self._cache.set_state(dialog_id, DialogState.AWAITING_AGENT.value, ttl=None)
         
-        # 5. ВАЖНО: Используем НОВЫЙ метод репозитория
-        # Даже для ручного выбора мы теперь используем таргетинг по ID
-        await self._queue.add_to_queue_targeted(
+        await self._queue.add_to_queue(
             dialog_id=dialog_id, 
             user_id=user_id, 
-            allowed_agent_ids=target_ids_str,
-            display_group_name=group_id # Используем ID группы как название для отображения
+            allowed_agent_ids=target_ids,
+            display_group_name=group_id
         )
         
         return {"status": "ok", "message": "Queued manually"}
-Шаг 2. Чистим DialogQueueRepository.py
-Теперь, когда оба метода сервиса (join_targeted_support и join_support_queue) используют add_to_queue_targeted, старый add_to_queue можно удалить (или переименовать в add_to_queue_targeted, чтобы было короче).
 
-Файл: src/components/agent_service/infractructure/repositories/impl/DialogQueueRepository.py
+    async def change_dialog_group(
+        self, 
+        dialog_id: str, 
+        new_group_id: str
+    ) -> Dict[str, str]: 
+        """Перевод диалога на другую группу (Трансфер)"""
+        
+        # 1. Находим, КТО работает в новой группе
+        target_ids = await self._routing_repo.get_working_group_ids(new_group_id)
+        
+        if not target_ids:
+             # Попытка фоллбэка на general код
+             if new_group_id == "general":
+                 target_ids = await self._routing_repo.get_working_group_ids("m0000") 
+             
+             if not target_ids:
+                 logger.error(f"Cannot transfer: no agents found for group {new_group_id}")
+                 # Можно кинуть ошибку или вернуть статус
+                 return {"status": "error", "message": "No agents available for transfer"}
 
+        target_ids_str = [str(x) for x in target_ids]
+
+        # 2. Обновляем метку в кеше
+        await self._cache.set_work_group(dialog_id, new_group_id)
+
+        # 3. Сценарий А: Диалог еще в очереди -> обновляем видимость (LSET)
+        is_in_queue = await self._queue.update_queue_targeting(
+            dialog_id, 
+            new_allowed_ids=target_ids_str, 
+            new_display_group=new_group_id
+        )
+
+        if is_in_queue:
+            return {"status": "ok", "message": "Queue item updated"}
+        
+        # 4. Сценарий Б: Диалог уже взят (Agent Handled) -> Возвращаем в очередь
+        
+        # Снимаем текущего агента
+        await self._cache.release_dialog(dialog_id)
+        
+        # Меняем статус
+        await self._cache.set_state(dialog_id, DialogState.AWAITING_AGENT.value, ttl=None)
+        
+        # Уведомляем систему/юзера (опционально можно добавить в историю)
+        # system_text = f"Диалог переведен на группу '{new_group_id}'"
+        # ... logic to add system message ...
+
+        # Получаем user_id для восстановления в очереди
+        user_id = await self._cache.get_user_id(dialog_id)
+        if not user_id:
+             user_id = await self._dialog.get_user_id_by_dialog(uuid.UUID(dialog_id))
+
+        # Добавляем в конец очереди с НОВЫМИ правами доступа
+        await self._queue.add_to_queue(
+            dialog_id=dialog_id,
+            user_id=user_id,
+            allowed_agent_ids=target_ids,
+            display_group_name=new_group_id
+        )
+        
+        # Лог в SQL
+        await self._dialog.set_status(
+            dialog_id, 
+            user_id,
+            DialogState.AWAITING_AGENT.value, 
+            "TRANSFER"
+        )
+
+        return {"status": "ok", "message": "Transferred to new group queue"}
+
+    # === Работа агента с диалогом ===
+
+    async def claim_dialog(
+        self, 
+        dialog_id:  str, 
+        agent_id: str, 
+        user_id: str
+    ) -> ClaimDialogResponse: 
+        # Удаляем из очереди (любой)
+        removed = await self._queue.remove_from_queue(dialog_id)
+        if not removed:
+            raise Exception("Dialog already claimed or not found in queue")
+
+        await self._cache.claim_dialog(dialog_id, agent_id, user_id)
+        
+        await self._dialog.set_status(
+            dialog_id, user_id, 
+            DialogState.AGENT_HANDLED.value, 
+            agent_id
+        )
+
+        details = await self.get_dialog_details(dialog_id, agent_id, user_id)
+        
+        return ClaimDialogResponse(
+            history=details.messages,
+            analysis=details.analysis,
+            dialog=details.dialog
+        )
+
+    async def get_dialog_details(
+        self, 
+        dialog_id: str, 
+        agent_id:  str, 
+        user_id: str
+    ) -> DialogDetailsResponse: 
+        owner_agent_id = await self._cache.get_agent_id(dialog_id)
+        state = await self._cache.get_state(dialog_id)
+        group_id = await self._cache.get_work_group(dialog_id) or "general"
+
+        allowed_states = [DialogState.AWAITING_AGENT.value, DialogState.CLOSED.value]
+        if state not in allowed_states and owner_agent_id != agent_id: 
+            raise Exception("Agent does not own this dialog")
+
+        user_id_to_use = user_id or await self._cache.get_user_id(dialog_id)
+        if not user_id_to_use:
+            user_id_to_use = await self._dialog.get_user_id_by_dialog(uuid.UUID(dialog_id))
+            if not user_id_to_use: 
+                raise Exception("User ID for dialog not found")
+
+        raw_history = await self._msg.get_history(
+            uuid.UUID(user_id_to_use), 
+            uuid.UUID(dialog_id)
+        )
+
+        formatted_history = [
+            MessageModel(
+                id=f"msg-{dialog_id}-{i}",
+                role=msg.get("role"),
+                content=msg.get("content"),
+                timestamp=msg.get("timestamp")
+            )
+            for i, msg in enumerate(raw_history)
+            if msg.get("role") != "system"
+        ]
+
+        return DialogDetailsResponse(
+            dialog=DialogModel(id=dialog_id, userId=user_id_to_use, workGroupId=group_id),
+            messages=formatted_history,
+            analysis=await self._cache.get_analysis(dialog_id),
+        )
+
+    async def get_dialog_history(
+        self, 
+        user_id: str, 
+        session_id: str
+    ) -> List[Dict[str, str]]:
+        return await self._msg.get_history(uuid.UUID(user_id), uuid.UUID(session_id))
+
+    # === Сообщения ===
+
+    async def send_message(
+        self, 
+        dialog_id:  str, 
+        agent_id: str, 
+        user_id: str, 
+        text: str
+    ) -> StatusResponse: 
+        state = await self._cache.get_state(dialog_id)
+        if state == DialogState.CLOSED.value:
+            raise Exception("Cannot send message to a closed dialog")
+
+        is_from_user = agent_id == "user_is_sending"
+        role = MessageRole.USER if is_from_user else MessageRole.AGENT
+
+        last_mid = await self._msg.get_last_message_id(
+            uuid.UUID(user_id), 
+            uuid.UUID(dialog_id)
+        )
+        await self._msg.add_message(
+            uuid.UUID(user_id),
+            uuid.UUID(dialog_id),
+            last_mid + 1,
+            role,
+            text
+        )
+
+        if is_from_user:
+            await self._cache.push_message_to_agent(dialog_id, text)
+        else: 
+            await self._cache.push_message_to_user(
+                dialog_id, 
+                {"status": "ok", "role": "agent", "text": text}
+            )
+
+        return StatusResponse(status="sent")
+
+    async def get_messages(self, dialog_id:  str) -> GetMessagesResponse: 
+        """Получить сообщения для агента (от пользователя)"""
+        text = await self._cache.pop_message_for_agent(dialog_id)
+        return GetMessagesResponse(
+            message=PolledMessage(role="user", text=text) if text else None
+        )
+
+    async def get_user_messages(self, dialog_id: str) -> GetMessagesResponse:
+        """Получить сообщения для пользователя (от агента)"""
+        payload = await self._cache.pop_message_for_user(dialog_id)
+        return GetMessagesResponse(
+            message=PolledMessage.model_validate(payload) if payload else None
+        )
+
+    # === Закрытие диалога ===
+
+    async def close_dialog(self, dialog_id: str, agent_id: str) -> StatusResponse:
+        owner_agent_id = await self._cache.get_agent_id(dialog_id)
+        if owner_agent_id != agent_id:
+            raise Exception("Agent does not own this dialog")
+
+        user_id = await self._cache.get_user_id(dialog_id)
+        
+        await self._cache.set_state(dialog_id, DialogState.CLOSED.value, ttl=None)
+        
+        await self._cache.push_message_to_user(
+            dialog_id, 
+            {"status": "closed", "role": "system", "text": "Диалог завершен оператором."}
+        )
+
+        if user_id: 
+            await self._dialog.set_status(
+                dialog_id, user_id, 
+                DialogState.CLOSED.value, 
+                agent_id
+            )
+
+        return StatusResponse(status="closed")
+
+    async def close_dialog_by_user(
+        self, 
+        dialog_id: str, 
+        user_id: str
+    ) -> Dict[str, str]: 
+        state = await self._dialog.get_status(dialog_id, user_id)
+        
+        if not state:
+            return {"status": "error", "message": "Dialog not found"}
+        if state == DialogState.CLOSED.value:
+            return {"status": "error", "message": "Dialog already closed"}
+
+        await self._dialog.set_status(
+            dialog_id, user_id, 
+            DialogState.CLOSED.value, 
+            "USER"
+        )
+    
+        await self._cache.set_state(dialog_id, DialogState.CLOSED.value, ttl=None)
+
+        system_text = "Пользователь завершил диалог."
+        await self._cache.push_message_to_agent(dialog_id, system_text)
+
+        last_mid = await self._msg.get_last_message_id(
+            uuid.UUID(user_id), 
+            uuid.UUID(dialog_id)
+        )
+        await self._msg.add_message(
+            uuid.UUID(user_id),
+            uuid.UUID(dialog_id),
+            last_mid + 1,
+            MessageRole.SYSTEM,
+            system_text
+        )
+
+        return {"status": "success", "message": "Dialog closed by user"}
+
+    async def delete_dialog(
+        self, 
+        user_id: str, 
+        session_id: str
+    ) -> Dict[str, str]: 
+        """Пользователь удаляет диалог (мягкое удаление)"""
+        await self._dialog.set_status(
+            session_id, user_id, 
+            "DELETED_BY_USER", 
+            "USER"
+        )
+        return {"status": "ok"}
+2. src/components/agent_service/infractructure/repositories/impl/DialogQueueRepository.py
+Что изменилось:
+
+add_to_queue: Теперь принимает allowed_agent_ids и сохраняет их в JSON.
+get_awaiting_dialogs: Фильтрует диалоги, проверяя, есть ли requesting_agent_id в списке allowed_ids.
+update_queue_targeting: Реализован через lset для обновления прав доступа "на лету" (без удаления и добавления в конец).
 code
 Python
 
@@ -83,17 +453,82 @@ download
 content_copy
 
 expand_less
-# ...
+import json
+import logging
+from datetime import datetime
+from typing import List, Union
 
-    # ОСТАВЛЯЕМ ТОЛЬКО ЭТОТ МЕТОД (можно переименовать его обратно в add_to_queue, если поправишь интерфейс)
-    async def add_to_queue_targeted(
+from ..core import IDialogQueueRepository
+from ....models import DialogModel
+from mbi.copilot.src.infrastructure.keydb.core import ICache
+
+__all__ = ["DialogQueueRepository"]
+
+logger = logging.getLogger(__name__)
+
+
+class DialogQueueRepository(IDialogQueueRepository):
+
+    # Единый ключ очереди для всех (фильтрация происходит на чтении)
+    QUEUE_KEY = "dialogs:awaiting_agent_queue"
+
+    def __init__(self, cache: ICache):
+        self._cache = cache
+
+    async def get_awaiting_dialogs(self, requesting_agent_id: str) -> List[DialogModel]:
+        """
+        Возвращает только те диалоги, в списке доступа которых есть requesting_agent_id.
+        """
+        payloads = await self._cache.lrange(self.QUEUE_KEY, 0, -1)
+        result_dialogs = []
+        
+        req_id_str = str(requesting_agent_id)
+
+        for payload_str in payloads:
+            try:
+                if isinstance(payload_str, bytes):
+                    payload_str = payload_str.decode()
+                
+                item = json.loads(payload_str)
+                allowed_ids = item.get("allowed_ids", [])
+                
+                # ЛОГИКА ФИЛЬТРАЦИИ:
+                # Если список разрешенных ID пуст (например, legacy), можно либо показывать всем, либо никому.
+                # Здесь строгая логика: если allowed_ids задан, проверяем вхождение.
+                # Если allowed_ids пуст/нет - считаем это "general" или старым диалогом (можно показать или скрыть по бизнес-логике).
+                
+                is_visible = False
+                if allowed_ids:
+                    if req_id_str in allowed_ids:
+                        is_visible = True
+                else:
+                    # Fallback для старых диалогов без allowed_ids (показывать всем)
+                    is_visible = True
+
+                if is_visible:
+                    result_dialogs.append(DialogModel(
+                        id=item["dialog_id"],
+                        userId=item["user_id"],
+                        # Отдаем display_group для красивого отображения на фронте
+                        workGroupId=item.get("display_group", "General")
+                    ))
+            except (json.JSONDecodeError, KeyError, TypeError) as e:
+                logger.error(f"Failed to parse queue item: {e}")
+                continue
+
+        return result_dialogs
+
+
+    async def add_to_queue(
         self, 
         dialog_id: str, 
         user_id: str, 
         allowed_agent_ids: List[Union[str, int]], 
-        display_group_name: str = "General"
+        display_group_name: str
     ) -> None:
-        
+        """
+        Добавляет диалог в очередь с белым списком агентов.
+        """
         allowed_ids_str = [str(aid) for aid in allowed_agent_ids]
 
         payload = json.dumps({
@@ -101,18 +536,76 @@ expand_less
             "user_id": user_id,
             "allowed_ids": allowed_ids_str,
             "display_group": display_group_name,
-            "timestamp": "..."
+            "timestamp": datetime.now().isoformat()
         })
         
         await self._cache.rpush(self.QUEUE_KEY, [payload])
         logger.info(f"Dialog {dialog_id} added to queue. Target Agents: {allowed_ids_str}")
 
-    # СТАРЫЙ add_to_queue УДАЛЯЕМ
-Итог
-Теперь у тебя единая логика:
+    async def remove_from_queue(self, dialog_id: str) -> bool:
+        """
+        Удаляет диалог из очереди по ID.
+        """
+        items = await self._cache.lrange(self.QUEUE_KEY, 0, -1)
+        for item_str in items:
+            try:
+                val = item_str.decode() if isinstance(item_str, bytes) else item_str
+                item = json.loads(val)
+                if item.get("dialog_id") == dialog_id:
+                    await self._cache.lrem(self.QUEUE_KEY, 1, item_str)
+                    return True
+            except:
+                continue
+        return False
+    
+    async def is_in_queue(self, dialog_id: str) -> bool:
+        items = await self._cache.lrange(self.QUEUE_KEY, 0, -1)
+        for item_str in items:
+            try: 
+                if isinstance(item_str, bytes):
+                    item_str = item_str.decode()
+                item = json.loads(item_str)
+                if item.get("dialog_id") == dialog_id:
+                    return True
+            except (json.JSONDecodeError, KeyError):
+                continue
+        return False
+    
+    async def update_queue_targeting(
+        self, 
+        dialog_id: str, 
+        new_allowed_ids: List[str], 
+        new_display_group: str
+    ) -> bool:
+        """
+        Обновляет права доступа (allowed_ids) для диалога, лежащего в очереди.
+        Использует lset для атомарного обновления элемента.
+        """
+        items = await self._cache.lrange(self.QUEUE_KEY, 0, -1)
+        found_index = -1
+        target_item = None
 
-И AI, и Пользователь выбирают группу.
-Сервис всегда идет в базу (RoutingRepository) и превращает группу в список ID сотрудников.
-В очередь всегда попадает диалог с полем allowed_ids.
-Агент всегда видит только то, что ему разрешено.
-Это самая чистая архитектура.
+        for idx, item_str in enumerate(items):
+            try:
+                val = item_str.decode() if isinstance(item_str, bytes) else item_str
+                item = json.loads(val)
+                if item.get("dialog_id") == dialog_id:
+                    found_index = idx
+                    target_item = item
+                    break
+            except:
+                continue
+        
+        if found_index != -1 and target_item:
+            # Обновляем поля
+            target_item["allowed_ids"] = [str(aid) for aid in new_allowed_ids]
+            target_item["display_group"] = new_display_group
+            
+            new_payload = json.dumps(target_item)
+            
+            # Перезаписываем элемент по индексу
+            await self._cache.lset(self.QUEUE_KEY, found_index, new_payload)
+            logger.info(f"Updated queue targeting for {dialog_id} -> {new_display_group}")
+            return True
+            
+        return False
