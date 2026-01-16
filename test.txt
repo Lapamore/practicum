@@ -1,611 +1,416 @@
-Вот полные файлы с реализованной логикой переключения групп (трансфера) и таргетированной очереди.
+import { TreeSelectOption } from 'ui-kit';
 
-1. src/components/agent_service/infractructure/services/impl/AgentService.py
-Что изменилось:
-
-change_dialog_group: Теперь это не просто смена метки. Он ищет IDs сотрудников новой группы. Если диалог в очереди — обновляет права доступа (update_queue_targeting). Если диалог у агента — отбирает его (release_dialog) и возвращает в очередь к новым сотрудникам.
-join_support_queue: (Ручной выбор) Теперь тоже ходит в базу за ID сотрудников, чтобы очередь была таргетированной.
-code
-Python
-
-download
-
-content_copy
-
-expand_less
-import uuid
-import logging
-from typing import Any, Dict, List, Optional
-
-from ..core import IAgentService
-from ...repositories.core import (
-    IDialogRepository,
-    IDialogCacheRepository,
-    IDialogQueueRepository,
-    IMessageRepository,
-    IStatisticsRepository,
-)
-from ....models import DialogModel, MessageModel, PolledMessage, MessageRole
-from mbi.copilot.src.components.models import DialogState
-from mbi.copilot.src.web.models.response import (
-    StatisticsResponse,
-    ClaimDialogResponse,
-    DialogDetailsResponse,
-    GetMessagesResponse,
-    StatusResponse,
-)
-
-from mbi.copilot.src.components.routing.infrastructure.repositories.core import IRoutingRepository
-
-__all__ = ["AgentService"]
-
-logger = logging.getLogger(__name__)
-
-
-class AgentService(IAgentService):
-    def __init__(
-        self,
-        dialog_repo: IDialogRepository,
-        cache_repo: IDialogCacheRepository,
-        queue_repo: IDialogQueueRepository,
-        msg_repo:  IMessageRepository,
-        stats_repo:  IStatisticsRepository,
-        routing_repo: IRoutingRepository
-    ):
-        self._dialog = dialog_repo
-        self._cache = cache_repo
-        self._queue = queue_repo
-        self._msg = msg_repo
-        self._stats = stats_repo
-        self._routing_repo = routing_repo
-
-    # === Статистика ===
-
-    async def get_statistics(self) -> StatisticsResponse: 
-        return await self._stats.get_statistics()
-
-    async def rate_dialog(
-        self, 
-        dialog_id: str, 
-        user_id:  str, 
-        rating: str, 
-        comment: str = None, 
-        is_resolved: bool = None
-    ) -> StatusResponse:
-        if rating not in ["like", "dislike"]:
-            raise ValueError("Rating must be 'like' or 'dislike'")
-        await self._stats.log_rating(dialog_id, user_id, rating, comment, is_resolved)
-        return StatusResponse(status="rating_recorded")
-
-    # === Очередь и получение диалогов ===
-
-    async def get_awaiting_dialogs(self, requesting_agent_id: str = None) -> List[DialogModel]:
-        if not requesting_agent_id:
-            return []
-        return await self._queue.get_awaiting_dialogs(requesting_agent_id)
-    
-    async def get_my_active_dialogs(self, agent_id: str) -> List[Dict]: 
-        dialogs = await self._dialog.get_active_agent_dialogs(agent_id)
-        result = []
-        for d in dialogs: 
-            dialog_dict = d.model_dump() if hasattr(d, 'model_dump') else d
-            group = await self._cache.get_work_group(dialog_dict["id"])
-            if group:
-                dialog_dict["workGroupId"] = group
-            result.append(dialog_dict)
-        return result
-
-    async def get_finished_dialogs(self, agent_id:  str) -> List[Dict]:
-        dialogs = await self._dialog.get_finished_dialogs(agent_id)
-        return [d.model_dump() if hasattr(d, 'model_dump') else d for d in dialogs]
-
-    async def get_user_dialogs(self, user_id:  str) -> List[Dict[str, Any]]: 
-        return await self._dialog.get_user_dialogs(uuid.UUID(user_id))
-
-    # === Подключение к поддержке ===
-
-    async def join_targeted_support(
-        self, 
-        dialog_id: str, 
-        user_id: str, 
-        target_agent_ids: List[int],
-        group_display_name: str
-    ) -> Dict[str, str]:
-        """Автоматическое добавление AI с известными ID"""
-        await self._cache.set_work_group(dialog_id, group_display_name)
-        
-        await self._dialog.set_status(
-            dialog_id, user_id, 
-            DialogState.AWAITING_AGENT.value, 
-            "AI_ROUTER"
-        )
-        
-        await self._cache.set_state(dialog_id, DialogState.AWAITING_AGENT.value, ttl=None)
-        
-        await self._queue.add_to_queue(
-            dialog_id=dialog_id, 
-            user_id=user_id, 
-            allowed_agent_ids=target_agent_ids,
-            display_group_name=group_display_name
-        )
-        
-        return {"status": "ok", "message": "Queued for specific agents"}
-
-    async def join_support_queue(
-        self, 
-        dialog_id: str, 
-        user_id: str, 
-        group_id: str
-    ) -> Dict[str, str]:
-        """Ручное добавление пользователем (ищем ID по группе)"""
-        
-        # 1. Получаем ID сотрудников для выбранной группы
-        target_ids = await self._routing_repo.get_working_group_ids(group_id)
-        
-        # Fallback, если группа не найдена (например, general)
-        if not target_ids:
-             target_ids = await self._routing_repo.get_working_group_ids("general") or []
-
-        await self._cache.set_work_group(dialog_id, group_id)
-        
-        await self._dialog.set_status(
-            dialog_id, user_id, 
-            DialogState.AWAITING_AGENT.value, 
-            "USER_MANUAL"
-        )
-        
-        await self._cache.set_state(dialog_id, DialogState.AWAITING_AGENT.value, ttl=None)
-        
-        await self._queue.add_to_queue(
-            dialog_id=dialog_id, 
-            user_id=user_id, 
-            allowed_agent_ids=target_ids,
-            display_group_name=group_id
-        )
-        
-        return {"status": "ok", "message": "Queued manually"}
-
-    async def change_dialog_group(
-        self, 
-        dialog_id: str, 
-        new_group_id: str
-    ) -> Dict[str, str]: 
-        """Перевод диалога на другую группу (Трансфер)"""
-        
-        # 1. Находим, КТО работает в новой группе
-        target_ids = await self._routing_repo.get_working_group_ids(new_group_id)
-        
-        if not target_ids:
-             # Попытка фоллбэка на general код
-             if new_group_id == "general":
-                 target_ids = await self._routing_repo.get_working_group_ids("m0000") 
-             
-             if not target_ids:
-                 logger.error(f"Cannot transfer: no agents found for group {new_group_id}")
-                 # Можно кинуть ошибку или вернуть статус
-                 return {"status": "error", "message": "No agents available for transfer"}
-
-        target_ids_str = [str(x) for x in target_ids]
-
-        # 2. Обновляем метку в кеше
-        await self._cache.set_work_group(dialog_id, new_group_id)
-
-        # 3. Сценарий А: Диалог еще в очереди -> обновляем видимость (LSET)
-        is_in_queue = await self._queue.update_queue_targeting(
-            dialog_id, 
-            new_allowed_ids=target_ids_str, 
-            new_display_group=new_group_id
-        )
-
-        if is_in_queue:
-            return {"status": "ok", "message": "Queue item updated"}
-        
-        # 4. Сценарий Б: Диалог уже взят (Agent Handled) -> Возвращаем в очередь
-        
-        # Снимаем текущего агента
-        await self._cache.release_dialog(dialog_id)
-        
-        # Меняем статус
-        await self._cache.set_state(dialog_id, DialogState.AWAITING_AGENT.value, ttl=None)
-        
-        # Уведомляем систему/юзера (опционально можно добавить в историю)
-        # system_text = f"Диалог переведен на группу '{new_group_id}'"
-        # ... logic to add system message ...
-
-        # Получаем user_id для восстановления в очереди
-        user_id = await self._cache.get_user_id(dialog_id)
-        if not user_id:
-             user_id = await self._dialog.get_user_id_by_dialog(uuid.UUID(dialog_id))
-
-        # Добавляем в конец очереди с НОВЫМИ правами доступа
-        await self._queue.add_to_queue(
-            dialog_id=dialog_id,
-            user_id=user_id,
-            allowed_agent_ids=target_ids,
-            display_group_name=new_group_id
-        )
-        
-        # Лог в SQL
-        await self._dialog.set_status(
-            dialog_id, 
-            user_id,
-            DialogState.AWAITING_AGENT.value, 
-            "TRANSFER"
-        )
-
-        return {"status": "ok", "message": "Transferred to new group queue"}
-
-    # === Работа агента с диалогом ===
-
-    async def claim_dialog(
-        self, 
-        dialog_id:  str, 
-        agent_id: str, 
-        user_id: str
-    ) -> ClaimDialogResponse: 
-        # Удаляем из очереди (любой)
-        removed = await self._queue.remove_from_queue(dialog_id)
-        if not removed:
-            raise Exception("Dialog already claimed or not found in queue")
-
-        await self._cache.claim_dialog(dialog_id, agent_id, user_id)
-        
-        await self._dialog.set_status(
-            dialog_id, user_id, 
-            DialogState.AGENT_HANDLED.value, 
-            agent_id
-        )
-
-        details = await self.get_dialog_details(dialog_id, agent_id, user_id)
-        
-        return ClaimDialogResponse(
-            history=details.messages,
-            analysis=details.analysis,
-            dialog=details.dialog
-        )
-
-    async def get_dialog_details(
-        self, 
-        dialog_id: str, 
-        agent_id:  str, 
-        user_id: str
-    ) -> DialogDetailsResponse: 
-        owner_agent_id = await self._cache.get_agent_id(dialog_id)
-        state = await self._cache.get_state(dialog_id)
-        group_id = await self._cache.get_work_group(dialog_id) or "general"
-
-        allowed_states = [DialogState.AWAITING_AGENT.value, DialogState.CLOSED.value]
-        if state not in allowed_states and owner_agent_id != agent_id: 
-            raise Exception("Agent does not own this dialog")
-
-        user_id_to_use = user_id or await self._cache.get_user_id(dialog_id)
-        if not user_id_to_use:
-            user_id_to_use = await self._dialog.get_user_id_by_dialog(uuid.UUID(dialog_id))
-            if not user_id_to_use: 
-                raise Exception("User ID for dialog not found")
-
-        raw_history = await self._msg.get_history(
-            uuid.UUID(user_id_to_use), 
-            uuid.UUID(dialog_id)
-        )
-
-        formatted_history = [
-            MessageModel(
-                id=f"msg-{dialog_id}-{i}",
-                role=msg.get("role"),
-                content=msg.get("content"),
-                timestamp=msg.get("timestamp")
-            )
-            for i, msg in enumerate(raw_history)
-            if msg.get("role") != "system"
+export const ROUTING_TREE_DATA: TreeSelectOption[] = [
+  {
+    label: "Продукты КИБ, в т.ч. Кубы",
+    value: "cat_1_cib",
+    children: [
+      { label: "Куб по гарантиям ЮЛ (оперативный)", value: "m0097|Куб по гарантиям ЮЛ (оперативный)" },
+      { label: "Куб данных по кредитам юр.лиц (оперативный)", value: "m0010|Куб данных по кредитам юр.лиц (оперативный)" },
+      { label: "Куб по кредитам ЮЛ по продуктам ММБ (ежемесячный)", value: "m0095|Куб по кредитам ЮЛ по продуктам ММБ (ежемесячный)" },
+      { label: "Куб по сделкам совместного центра прибыли (СЦП)", value: "p0062|Куб по сделкам совместного центра прибыли (СЦП)" },
+      { label: "Куб по гарантиям ежемесячный", value: "m0084|Куб по гарантиям ежемесячный" },
+      { label: "Куб по корпоративным клиентам (новый Средний+) оперативный", value: "m0035|Куб по корпоративным клиентам (новый Средний+) оперативный" },
+      { label: "Куб по внешнеэкономической деятельности (ВЭД)", value: "m0083|Куб по внешнеэкономической деятельности (ВЭД)" },
+      { label: "Куб данных по Платежной аналитике (ежемесячный)", value: "m0087|Куб данных по Платежной аналитике (ежемесячный)" },
+      { label: "Куб данных по ДЗО", value: "m0086|Куб данных по ДЗО" },
+      { label: "Куб по корпоративным клиентам (новый Средний+) ежемесячный", value: "m0034|Куб по корпоративным клиентам (новый Средний+) ежемесячный" },
+      { label: "Куб данных по проблемным активам ЮЛ (ДРПА ЮЛ)", value: "m0085|Куб данных по проблемным активам ЮЛ (ДРПА ЮЛ)" },
+      { label: "Куб по совокупному кредитному доходу (ежемесячный)", value: "p0071|Куб по совокупному кредитному доходу (ежемесячный)" },
+      { label: "Куб по продуктам благосостояния с данными по клиентам ЮЛ (ежемесячный)", value: "p0050|Куб по продуктам благосостояния с данными по клиентам ЮЛ (ежемесячный)" },
+      { label: "Куб по продуктам благосостояния (ежемесячный)", value: "p0050|Куб по продуктам благосостояния (ежемесячный)" },
+      { label: "Куб по облигациям (оперативный)", value: "p0065|Куб по облигациям (оперативный)" },
+      { label: "Куб по облигациям (ежемесячный)", value: "p0065|Куб по облигациям (ежемесячный)" },
+      { label: "Куб по брокерским операциям (ежемесячный)", value: "p0066|Куб по брокерским операциям (ежемесячный)" },
+      { label: "Куб по брокерским операциям (оперативный)", value: "p0066|Куб по брокерским операциям (оперативный)" },
+      {
+        label: "Куб по производным финансовым инструментам , ПФИ",
+        value: "cat_1_sub_pfi",
+        children: [
+            { label: "m0071 (Оперативный)", value: "m0071|Куб по производным финансовым инструментам , ПФИ (оперативный)" },
+            { label: "m0071 (Ежемесячный)", value: "m0071|Куб по производным финансовым инструментам , ПФИ (ежемесячный)" },
+            { label: "s0035 (ПФИ)", value: "s0035|Куб по производным финансовым инструментам (пфи)" }
         ]
-
-        return DialogDetailsResponse(
-            dialog=DialogModel(id=dialog_id, userId=user_id_to_use, workGroupId=group_id),
-            messages=formatted_history,
-            analysis=await self._cache.get_analysis(dialog_id),
-        )
-
-    async def get_dialog_history(
-        self, 
-        user_id: str, 
-        session_id: str
-    ) -> List[Dict[str, str]]:
-        return await self._msg.get_history(uuid.UUID(user_id), uuid.UUID(session_id))
-
-    # === Сообщения ===
-
-    async def send_message(
-        self, 
-        dialog_id:  str, 
-        agent_id: str, 
-        user_id: str, 
-        text: str
-    ) -> StatusResponse: 
-        state = await self._cache.get_state(dialog_id)
-        if state == DialogState.CLOSED.value:
-            raise Exception("Cannot send message to a closed dialog")
-
-        is_from_user = agent_id == "user_is_sending"
-        role = MessageRole.USER if is_from_user else MessageRole.AGENT
-
-        last_mid = await self._msg.get_last_message_id(
-            uuid.UUID(user_id), 
-            uuid.UUID(dialog_id)
-        )
-        await self._msg.add_message(
-            uuid.UUID(user_id),
-            uuid.UUID(dialog_id),
-            last_mid + 1,
-            role,
-            text
-        )
-
-        if is_from_user:
-            await self._cache.push_message_to_agent(dialog_id, text)
-        else: 
-            await self._cache.push_message_to_user(
-                dialog_id, 
-                {"status": "ok", "role": "agent", "text": text}
-            )
-
-        return StatusResponse(status="sent")
-
-    async def get_messages(self, dialog_id:  str) -> GetMessagesResponse: 
-        """Получить сообщения для агента (от пользователя)"""
-        text = await self._cache.pop_message_for_agent(dialog_id)
-        return GetMessagesResponse(
-            message=PolledMessage(role="user", text=text) if text else None
-        )
-
-    async def get_user_messages(self, dialog_id: str) -> GetMessagesResponse:
-        """Получить сообщения для пользователя (от агента)"""
-        payload = await self._cache.pop_message_for_user(dialog_id)
-        return GetMessagesResponse(
-            message=PolledMessage.model_validate(payload) if payload else None
-        )
-
-    # === Закрытие диалога ===
-
-    async def close_dialog(self, dialog_id: str, agent_id: str) -> StatusResponse:
-        owner_agent_id = await self._cache.get_agent_id(dialog_id)
-        if owner_agent_id != agent_id:
-            raise Exception("Agent does not own this dialog")
-
-        user_id = await self._cache.get_user_id(dialog_id)
-        
-        await self._cache.set_state(dialog_id, DialogState.CLOSED.value, ttl=None)
-        
-        await self._cache.push_message_to_user(
-            dialog_id, 
-            {"status": "closed", "role": "system", "text": "Диалог завершен оператором."}
-        )
-
-        if user_id: 
-            await self._dialog.set_status(
-                dialog_id, user_id, 
-                DialogState.CLOSED.value, 
-                agent_id
-            )
-
-        return StatusResponse(status="closed")
-
-    async def close_dialog_by_user(
-        self, 
-        dialog_id: str, 
-        user_id: str
-    ) -> Dict[str, str]: 
-        state = await self._dialog.get_status(dialog_id, user_id)
-        
-        if not state:
-            return {"status": "error", "message": "Dialog not found"}
-        if state == DialogState.CLOSED.value:
-            return {"status": "error", "message": "Dialog already closed"}
-
-        await self._dialog.set_status(
-            dialog_id, user_id, 
-            DialogState.CLOSED.value, 
-            "USER"
-        )
-    
-        await self._cache.set_state(dialog_id, DialogState.CLOSED.value, ttl=None)
-
-        system_text = "Пользователь завершил диалог."
-        await self._cache.push_message_to_agent(dialog_id, system_text)
-
-        last_mid = await self._msg.get_last_message_id(
-            uuid.UUID(user_id), 
-            uuid.UUID(dialog_id)
-        )
-        await self._msg.add_message(
-            uuid.UUID(user_id),
-            uuid.UUID(dialog_id),
-            last_mid + 1,
-            MessageRole.SYSTEM,
-            system_text
-        )
-
-        return {"status": "success", "message": "Dialog closed by user"}
-
-    async def delete_dialog(
-        self, 
-        user_id: str, 
-        session_id: str
-    ) -> Dict[str, str]: 
-        """Пользователь удаляет диалог (мягкое удаление)"""
-        await self._dialog.set_status(
-            session_id, user_id, 
-            "DELETED_BY_USER", 
-            "USER"
-        )
-        return {"status": "ok"}
-2. src/components/agent_service/infractructure/repositories/impl/DialogQueueRepository.py
-Что изменилось:
-
-add_to_queue: Теперь принимает allowed_agent_ids и сохраняет их в JSON.
-get_awaiting_dialogs: Фильтрует диалоги, проверяя, есть ли requesting_agent_id в списке allowed_ids.
-update_queue_targeting: Реализован через lset для обновления прав доступа "на лету" (без удаления и добавления в конец).
-code
-Python
-
-download
-
-content_copy
-
-expand_less
-import json
-import logging
-from datetime import datetime
-from typing import List, Union
-
-from ..core import IDialogQueueRepository
-from ....models import DialogModel
-from mbi.copilot.src.infrastructure.keydb.core import ICache
-
-__all__ = ["DialogQueueRepository"]
-
-logger = logging.getLogger(__name__)
-
-
-class DialogQueueRepository(IDialogQueueRepository):
-
-    # Единый ключ очереди для всех (фильтрация происходит на чтении)
-    QUEUE_KEY = "dialogs:awaiting_agent_queue"
-
-    def __init__(self, cache: ICache):
-        self._cache = cache
-
-    async def get_awaiting_dialogs(self, requesting_agent_id: str) -> List[DialogModel]:
-        """
-        Возвращает только те диалоги, в списке доступа которых есть requesting_agent_id.
-        """
-        payloads = await self._cache.lrange(self.QUEUE_KEY, 0, -1)
-        result_dialogs = []
-        
-        req_id_str = str(requesting_agent_id)
-
-        for payload_str in payloads:
-            try:
-                if isinstance(payload_str, bytes):
-                    payload_str = payload_str.decode()
-                
-                item = json.loads(payload_str)
-                allowed_ids = item.get("allowed_ids", [])
-                
-                # ЛОГИКА ФИЛЬТРАЦИИ:
-                # Если список разрешенных ID пуст (например, legacy), можно либо показывать всем, либо никому.
-                # Здесь строгая логика: если allowed_ids задан, проверяем вхождение.
-                # Если allowed_ids пуст/нет - считаем это "general" или старым диалогом (можно показать или скрыть по бизнес-логике).
-                
-                is_visible = False
-                if allowed_ids:
-                    if req_id_str in allowed_ids:
-                        is_visible = True
-                else:
-                    # Fallback для старых диалогов без allowed_ids (показывать всем)
-                    is_visible = True
-
-                if is_visible:
-                    result_dialogs.append(DialogModel(
-                        id=item["dialog_id"],
-                        userId=item["user_id"],
-                        # Отдаем display_group для красивого отображения на фронте
-                        workGroupId=item.get("display_group", "General")
-                    ))
-            except (json.JSONDecodeError, KeyError, TypeError) as e:
-                logger.error(f"Failed to parse queue item: {e}")
-                continue
-
-        return result_dialogs
-
-
-    async def add_to_queue(
-        self, 
-        dialog_id: str, 
-        user_id: str, 
-        allowed_agent_ids: List[Union[str, int]], 
-        display_group_name: str
-    ) -> None:
-        """
-        Добавляет диалог в очередь с белым списком агентов.
-        """
-        allowed_ids_str = [str(aid) for aid in allowed_agent_ids]
-
-        payload = json.dumps({
-            "dialog_id": dialog_id,
-            "user_id": user_id,
-            "allowed_ids": allowed_ids_str,
-            "display_group": display_group_name,
-            "timestamp": datetime.now().isoformat()
-        })
-        
-        await self._cache.rpush(self.QUEUE_KEY, [payload])
-        logger.info(f"Dialog {dialog_id} added to queue. Target Agents: {allowed_ids_str}")
-
-    async def remove_from_queue(self, dialog_id: str) -> bool:
-        """
-        Удаляет диалог из очереди по ID.
-        """
-        items = await self._cache.lrange(self.QUEUE_KEY, 0, -1)
-        for item_str in items:
-            try:
-                val = item_str.decode() if isinstance(item_str, bytes) else item_str
-                item = json.loads(val)
-                if item.get("dialog_id") == dialog_id:
-                    await self._cache.lrem(self.QUEUE_KEY, 1, item_str)
-                    return True
-            except:
-                continue
-        return False
-    
-    async def is_in_queue(self, dialog_id: str) -> bool:
-        items = await self._cache.lrange(self.QUEUE_KEY, 0, -1)
-        for item_str in items:
-            try: 
-                if isinstance(item_str, bytes):
-                    item_str = item_str.decode()
-                item = json.loads(item_str)
-                if item.get("dialog_id") == dialog_id:
-                    return True
-            except (json.JSONDecodeError, KeyError):
-                continue
-        return False
-    
-    async def update_queue_targeting(
-        self, 
-        dialog_id: str, 
-        new_allowed_ids: List[str], 
-        new_display_group: str
-    ) -> bool:
-        """
-        Обновляет права доступа (allowed_ids) для диалога, лежащего в очереди.
-        Использует lset для атомарного обновления элемента.
-        """
-        items = await self._cache.lrange(self.QUEUE_KEY, 0, -1)
-        found_index = -1
-        target_item = None
-
-        for idx, item_str in enumerate(items):
-            try:
-                val = item_str.decode() if isinstance(item_str, bytes) else item_str
-                item = json.loads(val)
-                if item.get("dialog_id") == dialog_id:
-                    found_index = idx
-                    target_item = item
-                    break
-            except:
-                continue
-        
-        if found_index != -1 and target_item:
-            # Обновляем поля
-            target_item["allowed_ids"] = [str(aid) for aid in new_allowed_ids]
-            target_item["display_group"] = new_display_group
-            
-            new_payload = json.dumps(target_item)
-            
-            # Перезаписываем элемент по индексу
-            await self._cache.lset(self.QUEUE_KEY, found_index, new_payload)
-            logger.info(f"Updated queue targeting for {dialog_id} -> {new_display_group}")
-            return True
-            
-        return False
+      },
+      { label: "Производные финансовые инструменты - ПФИ (дневная)", value: "m0071|Производные финансовые инструменты - ПФИ (дневная)" },
+      { label: "Куб по конверсионным операциям", value: "p0054|Куб по конверсионным операциям" },
+      { label: "Куб rorwa по клиенту", value: "m0096|Куб rorwa по клиенту" },
+      { label: "Куб данных по аккредитивам юр. лиц (ежемесячный)", value: "m0102|Куб данных по аккредитивам юр. лиц (ежемесячный)" },
+      { label: "Куб по аккредитивам юр лиц (оперативный)", value: "m0102|Куб по аккредитивам юр лиц (оперативный)" },
+      { label: "Куб данных по пассивам юр. лиц (ежедневный)", value: "p0024|Куб данных по пассивам юр. лиц (ежедневный)" },
+      { label: "Куб данных по пассивам юр. лиц с обезличенными данными", value: "p0024|Куб данных по пассивам юр. лиц с обезличенными данными" },
+      { label: "Куб данных по пассивам юр. лиц (ежемесячный)", value: "p0024|Куб данных по пассивам юр. лиц (ежемесячный)" },
+      { label: "Куб данных по кредитам юр.лиц (ежемесячный)", value: "m0009|Куб данных по кредитам юр.лиц (ежемесячный)" },
+      { label: "Куб данных по кредитам юр.лиц (ежемесячный LITE)", value: "m0009|Куб данных по кредитам юр.лиц (ежемесячный LITE)" },
+      { label: "Отчеты МСП", value: "m0009|Отчеты МСП" },
+      { 
+        label: "Куб по некредитным комиссиям, штрафам, РВП",
+        value: "cat_1_sub_noncredit",
+        children: [
+            { label: "p0019 (Ежемесячный)", value: "p0019|Куб по некредитным комиссиям, штрафам, РВП (ежемесячный)" },
+            { label: "p0019 (Оперативный)", value: "p0019|Куб по некредитным комиссиям, штрафам, РВП (оперативный)" }
+        ]
+      },
+      { label: "Куб по брокерским операциям (s0036)", value: "s0036|Куб по брокерским операциям" }
+    ]
+  },
+  {
+    label: "Отчеты на Qlik Sense",
+    value: "cat_2_qlik",
+    children: [
+      { label: "Bi инструменты", value: "m0074|Bi инструменты" }
+    ]
+  },
+  {
+    label: "Продукты РБ, в том числе кубы",
+    value: "cat_3_rb",
+    children: [
+      { label: "Куб по денежной наличности", value: "m0099|Куб по денежной наличности" },
+      { label: "Куб по ФОТ и зарплатным проектам (ежемесячный)", value: "m0036|Куб по ФОТ и зарплатным проектам (ежемесячный)" },
+      { label: "Куб по ФОТ и зарплатным проектам (оперативный)", value: "m0036|Куб по ФОТ и зарплатным проектам (оперативный)" },
+      { label: "Куб по вкладам ФЛ", value: "p0012|Куб по вкладам ФЛ" },
+      { label: "Куб данных по сберегательным сертификатам", value: "p0031|Куб данных по сберегательным сертификатам" },
+      { label: "Векселя ФЛ (ПО)", value: "m0091|Векселя ФЛ (ПО)" },
+      { label: "Куб по пассивам ФЛ (оперативный)", value: "p0052|Куб по пассивам ФЛ (оперативный)" },
+      { label: "Аккредитивы ФЛ (ПО)", value: "m0090|Аккредитивы ФЛ (ПО)" },
+      {
+        label: "Куб данных по банковским картам",
+        value: "cat_3_sub_cards",
+        children: [
+            { label: "p0037 (с фин. рез. до уровня ГОСБ)", value: "p0037|Куб данных по банковским картам с финансовым результатом (до уровня ГОСБ) (ежемесячный)" },
+            { label: "p0037 (с фин. рез. детальный до ВСП)", value: "p0037|Куб данных по банковским картам с финансовым результатом (детальный - до уровня ВСП) (ежемесячный)" },
+            { label: "p0037 (ежедневный)", value: "p0037|Куб данных по банковским картам (ежедневный)" }
+        ]
+      },
+      { label: "Куб ДРПА по ФЛ", value: "p0053|Куб ДРПА по ФЛ" },
+      { label: "Куб данных по Эскроу физ. лиц (ежемесячный)", value: "p0070|Куб данных по Эскроу физ. лиц (ежемесячный)" },
+      { label: "Куб по пассивам фл (ежемесячный)", value: "c0060|Куб по пассивам фл (ежемесячный)" },
+      { 
+        label: "Куб по бюджетным зачислениям", 
+        value: "cat_3_sub_budget",
+        children: [
+            { label: "p0018 (Ежемесячный)", value: "p0018|Куб по бюджетным зачислениям (ежемесячный)" },
+            { label: "s0037 (DR СРЕДА)", value: "s0037|Куб по бюджетным зачислениям" }
+        ]
+      },
+      { label: "Куб по кредитным продуктам физ. лиц (заявки)", value: "c0064|Куб по кредитным продуктам физ. лиц (заявки)" },
+      { label: "Куб по банковским картам (оперативный)", value: "p0022|Куб по банковским картам (оперативный)" },
+      { label: "Куб по устройствам самообслуживания (оперативный)", value: "p0021|Куб по устройствам самообслуживания (оперативный)" },
+      { label: "Куб по устройствам самообслуживания (ежемесячный)", value: "p0023|Куб по устройствам самообслуживания (ежемесячный)" },
+      { label: "Куб данных по платежам", value: "p0056|Куб данных по платежам" },
+      { label: "Куб данных по активам физ. лиц", value: "p0011|Куб данных по активам физ. лиц" },
+      { label: "Куб данных по кредитам физ. Лиц", value: "p0051|Куб данных по кредитам физ. Лиц" },
+      { label: "Куб данных по переводам", value: "m0089|Куб данных по переводам" },
+      { 
+        label: "Куб по аренде индивидуальных сейфов", 
+        value: "cat_3_sub_safes",
+        children: [
+            { label: "p0014 (Оперативный)", value: "p0014|Куб по аренде индивидуальных сейфов (оперативный)" },
+            { label: "p0017 (Ежемесячный)", value: "p0017|Куб по аренде индивидуальных сейфов (ежемесячный)" },
+            { label: "s0038 (Оперативный DR)", value: "s0038|Куб по аренде индивидуальных сейфов (оперативный)" },
+            { label: "s0039 (Ежемесячный DR)", value: "s0039|куб по аренде индивидуальных сейфов (ежемесячный)" }
+        ]
+      },
+      { label: "Куб по продаже и покупке монет и слитков (оперативный)", value: "p0015|Куб по продаже и покупке монет и слитков (оперативный)" },
+      { label: "Куб по продаже и покупке монет и слитков (ежемесячный)", value: "p0016|Куб по продаже и покупке монет и слитков (ежемесячный)" },
+      { label: "Куб данных PL ВСП (БСП)", value: "m0088|Куб данных PL ВСП (БСП)" },
+      { label: "Куб данных по эквайрингу (ежемесячный)", value: "p0013|Куб данных по эквайрингу (ежемесячный)" },
+      { label: "Куб данных по эквайрингу (ежедневный)", value: "p0013|Куб данных по эквайрингу (ежедневный)" },
+      { label: "Куб БСП", value: "m0076|Куб БСП" }
+    ]
+  },
+  {
+    label: "Кубы РБ DR СРЕДА",
+    value: "cat_4_dr_rb_cubes",
+    children: [
+      { label: "Куб по денежной наличности", value: "s0044|Куб по денежной наличности" }
+    ]
+  },
+  {
+    label: "Продукты DR СРЕДА РБ",
+    value: "cat_5_dr_rb",
+    children: [
+      { label: "Дэшборд платежи фл dr", value: "m0023|Дэшборд платежи фл dr" },
+      { label: "Ежемесячный куб по PL ВСП", value: "s0033|Ежемесячный куб по PL ВСП" },
+      { label: "Ежемесячный куб ДРПА ФЛ", value: "s0032|Ежемесячный куб ДРПА ФЛ" },
+      { label: "Ежемесячный куб по вкладам физ. лиц", value: "s0031|Ежемесячный куб по вкладам физ. лиц" },
+      { label: "Куб по активам физ. лиц (ежедневный)", value: "s0030|Куб по активам физ. лиц (ежедневный)" },
+      { label: "Ежемесячный куб по Эскроу ФЛ", value: "s0029|Ежемесячный куб по Эскроу ФЛ" },
+      { label: "Куб данных по пассивам физ. лиц (ежедневный)", value: "s0028|Куб данных по пассивам физ. лиц (ежедневный)" },
+      { label: "Ежемесячный куб по вкладам физ. лиц (s0027)", value: "s0027|Ежемесячный куб по вкладам физ. лиц" },
+      { label: "Ежемесячный куб по продуктам благосостояния", value: "s0026|Ежемесячный куб по продуктам благосостояния" },
+      { label: "Ежедневный куб по эквайрингу (ежемес.+оперативный)", value: "s0025|Ежедневный куб по эквайрингу (ежемес.+оперативный)" },
+      { label: "Куб по устройствам самообслуживания (оперативный+ежемесячный)", value: "s0024|Куб по устройствам самообслуживания (оперативный+ежемесячный)" },
+      { label: "Оперативный куб по банковским картам + ежемес", value: "s0023|Оперативный куб по банковским картам + ежемес" },
+      { label: "Куб по продаже и покупке монет и слитков (ежемесячный)", value: "s0010|Куб по продаже и покупке монет и слитков (ежемесячный)" },
+      { label: "Куб по продаже и покупке монет и слитков (оперативный)", value: "s0010|Куб по продаже и покупке монет и слитков (оперативный)" },
+      { label: "Куб БСП", value: "s0007|Куб БСП" },
+      { label: "Куб по платежам", value: "s0008|Куб по платежам" },
+      { label: "Куб по переводам", value: "s0009|Куб по переводам" },
+      { label: "Куб по ФОТ и зарплатным проектам (ежемесячный)", value: "s0006|Куб по ФОТ и зарплатным проектам (ежемесячный)" },
+      { label: "Куб по ФОТ и зарплатным проектам (оперативный)", value: "s0006|Куб по ФОТ и зарплатным проектам (оперативный)" }
+    ]
+  },
+  {
+    label: "Продукты DR СРЕДА КИБ",
+    value: "cat_6_dr_cib",
+    children: [
+      { label: "Дэшборд средства ЮЛ summary", value: "m0022|Дэшборд средства ЮЛ summary" },
+      { label: "Куб по конверсионным операциям", value: "s0034|Куб по конверсионным операциям" },
+      { label: "Дэшборды отраслевая аналитика", value: "m0020|Дэшборды отраслевая аналитика" },
+      { label: "Дэшборды rorwa по клиенту юл", value: "m0021|Дэшборды rorwa по клиенту юл" },
+      { label: "Выпущенные облигации (ежемес и оперативный)", value: "s0022|Выпущенные облигации (ежемес и оперативный)" },
+      { label: "Куб по сделкам совместного центра прибыли (СЦП) (ежемесячный)", value: "s0020|Куб по сделкам совместного центра прибыли (СЦП) (ежемесячный)" },
+      { label: "Куб КЮЛ (оперативный)", value: "s0020|Куб КЮЛ (оперативный)" },
+      { label: "Куб КЮЛ (ежемесячный)", value: "s0019|Куб КЮЛ (ежемесячный)" },
+      { label: "Куб по проблемным активам юридических лиц (ДРПА ЮЛ) (ежемесячный)", value: "s0017|Куб по проблемным активам юридических лиц (ДРПА ЮЛ) (ежемесячный)" },
+      { label: "Куб по совокупному кредитному доходу (ежемесячный)", value: "s0016|Куб по совокупному кредитному доходу (ежемесячный)" },
+      { label: "Куб по внешнеэкономической деятельности (ВЭД) (ежемесячный)", value: "s0015|Куб по внешнеэкономической деятельности (ВЭД) (ежемесячный)" },
+      { label: "Куб по платежно аналитике (ежемесячный)", value: "s0014|Куб по платежно аналитике (ежемесячный)" },
+      { label: "Куб ПЮЛ (ежемесячный и оперативный)", value: "s0011|Куб ПЮЛ (ежемесячный и оперативный)" },
+      { label: "Куб ДЗО (ежемесячный)", value: "s0012|Куб ДЗО (ежемесячный)" },
+      { label: "Куб по корпоративным клиентам (оперативный и ежемесячный)", value: "s0021|Куб по корпоративным клиентам (оперативный и ежемесячный)" },
+      { label: "Куб АЮЛ (оперативный и ежемесячный)", value: "s0013|Куб АЮЛ (оперативный и ежемесячный)" },
+      { label: "Куб по некредитным комиссиям, штрафам, РВП (ежемесячный)", value: "s0005|Куб по некредитным комиссиям, штрафам, РВП (ежемесячный)" },
+      { label: "Куб по гарантиям (ежемесячный)", value: "s0004|Куб по гарантиям (ежемесячный)" }
+    ]
+  },
+  {
+    label: "Продукты DR СРЕДА",
+    value: "cat_7_dr_sreda",
+    children: [
+      { label: "Общие вопросы по Управленческому кубу", value: "s0001|Общие вопросы по Управленческому кубу" },
+      { label: "Куб по Доходным договорам (ежемесячный)", value: "s0002|Куб по Доходным договорам (ежемесячный)" },
+      { label: "Ежемесячный куб по финансовому результату ЦП «Недвижимость»", value: "s0003|Ежемесячный куб по финансовому результату ЦП «Недвижимость»" }
+    ]
+  },
+  {
+    label: "Управленческие кубы",
+    value: "cat_8_mng_cubes",
+    children: [
+      { 
+        label: "Новый оперативный куб (НОК)",
+        value: "cat_8_sub_nok",
+        children: [
+            { label: "s0043", value: "s0043|Новый оперативный куб (НОК)" },
+            { label: "p0020", value: "p0020|Новый оперативный куб (НОК)" }
+        ]
+      },
+      { 
+        label: "Оперативный бухгалтерский куб",
+        value: "cat_8_sub_obk",
+        children: [
+            { label: "s0042", value: "s0042|Оперативный бухгалтерский куб" },
+            { label: "p0067 (ОБК)", value: "p0067|Оперативный бухгалтерский куб (ОБК)" }
+        ]
+      },
+      { label: "Новый бухгалтерский куб (s0041)", value: "s0041|Новый бухгалтерский куб" },
+      { label: "Новый бухгалтерский куб (НБК) (p0040)", value: "p0040|Новый бухгалтерский куб (НБК)" },
+      { 
+        label: "Общие вопросы по Управленческому кубу",
+        value: "cat_8_sub_general",
+        children: [
+            { label: "s0001", value: "s0001|Общие вопросы по Управленческому кубу" },
+            { label: "c0021", value: "c0021|Общие вопросы по Управленческому кубу" }
+        ]
+      },
+      { label: "Витрина по прочему cdr", value: "m0104|Витрина по прочему cdr" },
+      { label: "Витрина по офр_межбанковским кредитам/депозитам", value: "m0103|Витрина по офр_межбанковским кредитам/депозитам" }
+    ]
+  },
+  {
+    label: "Новый оперативный куб",
+    value: "cat_9_nok",
+    children: [
+      { label: "Новый бухгалтерский куб", value: "s0041|Новый бухгалтерский куб" },
+      { 
+        label: "Новый оперативный куб (НОК)", 
+        value: "cat_9_sub_nok",
+        children: [
+            { label: "p0020", value: "p0020|Новый оперативный куб (НОК)" },
+            { label: "s0043", value: "s0043|Новый оперативный куб (НОК)" }
+        ]
+      }
+    ]
+  },
+  {
+    label: "Оперативный бухгалтерский куб",
+    value: "cat_10_obk",
+    children: [
+      { label: "Оперативный бухгалтерский куб (s0042)", value: "s0042|Оперативный бухгалтерский куб" },
+      { label: "Оперативный бухгалтерский куб (ОБК) (p0067)", value: "p0067|Оперативный бухгалтерский куб (ОБК)" }
+    ]
+  },
+  {
+    label: "ФОТ и зарплатные проекты",
+    value: "cat_11_fot",
+    children: [
+      { 
+        label: "Куб по ФОТ и зарплатным проектам (ежемесячный)",
+        value: "cat_11_sub_monthly",
+        children: [
+            { label: "m0036 (MIS)", value: "m0036|Куб по ФОТ и зарплатным проектам (ежемесячный)" },
+            { label: "s0006 (DR)", value: "s0006|Куб по ФОТ и зарплатным проектам (ежемесячный)" }
+        ]
+      },
+      {
+        label: "Куб по ФОТ и зарплатным проектам (оперативный)",
+        value: "cat_11_sub_operative",
+        children: [
+            { label: "m0036 (MIS)", value: "m0036|Куб по ФОТ и зарплатным проектам (оперативный)" },
+            { label: "s0006 (DR)", value: "s0006|Куб по ФОТ и зарплатным проектам (оперативный)" }
+        ]
+      }
+    ]
+  },
+  {
+    label: "Кредиты ЮЛ, включая микрокредиты",
+    value: "cat_12_credits_ul",
+    children: [
+      { label: "Куб данных по кредитам юр.лиц (ежемесячный)", value: "m0009|Куб данных по кредитам юр.лиц (ежемесячный)" },
+      { label: "Куб данных по кредитам юр.лиц (ежемесячный LITE)", value: "m0009|Куб данных по кредитам юр.лиц (ежемесячный LITE)" },
+      { label: "Отчеты МСП", value: "m0009|Отчеты МСП" }
+    ]
+  },
+  {
+    label: "Торговая книга",
+    value: "cat_13_trade_book",
+    children: [
+      { label: "Торговая книга", value: "m0003|Торговая книга" }
+    ]
+  },
+  {
+    label: "Управленческий куб - Факт",
+    value: "cat_14_mng_fact",
+    children: [
+      { label: "Торговая книга", value: "m0003|Торговая книга" },
+      { 
+        label: "Куб по ФОТ и зарплатным проектам (ежемесячный)", 
+        value: "cat_14_sub_fot_mon",
+        children: [
+            { label: "m0036", value: "m0036|Куб по ФОТ и зарплатным проектам (ежемесячный)" },
+            { label: "s0006", value: "s0006|Куб по ФОТ и зарплатным проектам (ежемесячный)" }
+        ]
+      },
+      { 
+        label: "Куб по ФОТ и зарплатным проектам (оперативный)", 
+        value: "cat_14_sub_fot_op",
+        children: [
+            { label: "m0036", value: "m0036|Куб по ФОТ и зарплатным проектам (оперативный)" },
+            { label: "s0006", value: "s0006|Куб по ФОТ и зарплатным проектам (оперативный)" }
+        ]
+      },
+      { label: "Куб данных по кредитам юр.лиц (ежемесячный)", value: "m0009|Куб данных по кредитам юр.лиц (ежемесячный)" },
+      { label: "Куб данных по кредитам юр.лиц (ежемесячный LITE)", value: "m0009|Куб данных по кредитам юр.лиц (ежемесячный LITE)" },
+      { label: "Отчеты МСП", value: "m0009|Отчеты МСП" },
+      { 
+        label: "Куб по некредитным комиссиям, штрафам, РВП (ежемесячный)", 
+        value: "cat_14_sub_noncred_mon",
+        children: [
+            { label: "p0019", value: "p0019|Куб по некредитным комиссиям, штрафам, РВП (ежемесячный)" },
+            { label: "s0005", value: "s0005|Куб по некредитным комиссиям, штрафам, РВП (ежемесячный)" }
+        ]
+      },
+      { label: "Куб по некредитным комиссиям, штрафам, РВП (оперативный)", value: "p0019|Куб по некредитным комиссиям, штрафам, РВП (оперативный)" },
+      { label: "Куб по вкладам ФЛ", value: "p0012|Куб по вкладам ФЛ" },
+      { label: "Куб данных по банковским картам с финансовым результатом (до уровня ГОСБ) (ежемесячный)", value: "p0037|Куб данных по банковским картам с финансовым результатом (до уровня ГОСБ) (ежемесячный)" },
+      { label: "Куб данных по банковским картам с финансовым результатом (детальный - до уровня ВСП) (ежемесячный)", value: "p0037|Куб данных по банковским картам с финансовым результатом (детальный - до уровня ВСП) (ежемесячный)" },
+      { label: "Куб данных по банковским картам (ежедневный)", value: "p0037|Куб данных по банковским картам (ежедневный)" },
+      { label: "Куб данных по кредитам физ. Лиц", value: "p0051|Куб данных по кредитам физ. Лиц" },
+      { label: "Куб данных по пассивам юр. лиц (ежедневный)", value: "p0024|Куб данных по пассивам юр. лиц (ежедневный)" },
+      { label: "Куб данных по пассивам юр. лиц с обезличенными данными", value: "p0024|Куб данных по пассивам юр. лиц с обезличенными данными" },
+      { label: "Куб данных по пассивам юр. лиц (ежемесячный)", value: "p0024|Куб данных по пассивам юр. лиц (ежемесячный)" },
+      { label: "Куб данных по эквайрингу (ежемесячный)", value: "p0013|Куб данных по эквайрингу (ежемесячный)" },
+      { label: "Куб данных по эквайрингу (ежедневный)", value: "p0013|Куб данных по эквайрингу (ежедневный)" },
+      { 
+        label: "Общие вопросы по Управленческому кубу",
+        value: "cat_14_sub_general",
+        children: [
+            { label: "c0021", value: "c0021|Общие вопросы по Управленческому кубу" },
+            { label: "s0001", value: "s0001|Общие вопросы по Управленческому кубу" }
+        ]
+      },
+      { label: "Витрина по офр_межбанковским кредитам/депозитам", value: "m0103|Витрина по офр_межбанковским кредитам/депозитам" },
+      { label: "Витрина по прочему cdr", value: "m0104|Витрина по прочему cdr" }
+    ]
+  },
+  {
+    label: "Некредитные доходы",
+    value: "cat_15_noncredit",
+    children: [
+      { 
+        label: "Куб по некредитным комиссиям, штрафам, РВП (ежемесячный)",
+        value: "cat_15_sub_mon",
+        children: [
+            { label: "p0019", value: "p0019|Куб по некредитным комиссиям, штрафам, РВП (ежемесячный)" },
+            { label: "s0005", value: "s0005|Куб по некредитным комиссиям, штрафам, РВП (ежемесячный)" }
+        ]
+      },
+      { label: "Куб по некредитным комиссиям, штрафам, РВП (оперативный)", value: "p0019|Куб по некредитным комиссиям, штрафам, РВП (оперативный)" }
+    ]
+  },
+  {
+    label: "Штрафы и РВП",
+    value: "cat_16_fines",
+    children: [
+      { 
+        label: "Куб по некредитным комиссиям, штрафам, РВП (ежемесячный)",
+        value: "cat_16_sub_mon",
+        children: [
+            { label: "s0005", value: "s0005|Куб по некредитным комиссиям, штрафам, РВП (ежемесячный)" },
+            { label: "p0019", value: "p0019|Куб по некредитным комиссиям, штрафам, РВП (ежемесячный)" }
+        ]
+      },
+      { label: "Куб по некредитным комиссиям, штрафам, РВП (оперативный)", value: "p0019|Куб по некредитным комиссиям, штрафам, РВП (оперативный)" }
+    ]
+  },
+  {
+    label: "Привлеченные средства ФЛ",
+    value: "cat_17_passive_fl",
+    children: [
+      { label: "Куб по вкладам ФЛ", value: "p0012|Куб по вкладам ФЛ" }
+    ]
+  },
+  {
+    label: "Банковские карты РБ",
+    value: "cat_18_cards_rb",
+    children: [
+      { label: "Куб данных по банковским картам с финансовым результатом (до уровня ГОСБ) (ежемесячный)", value: "p0037|Куб данных по банковским картам с финансовым результатом (до уровня ГОСБ) (ежемесячный)" },
+      { label: "Куб данных по банковским картам с финансовым результатом (детальный - до уровня ВСП) (ежемесячный)", value: "p0037|Куб данных по банковским картам с финансовым результатом (детальный - до уровня ВСП) (ежемесячный)" },
+      { label: "Куб данных по банковским картам (ежедневный)", value: "p0037|Куб данных по банковским картам (ежедневный)" }
+    ]
+  },
+  {
+    label: "Навигатор",
+    value: "cat_19_navigator",
+    children: [
+      { label: "Навигатор", value: "m0019|Навигатор" },
+      { label: "Переназначенные вопросы", value: "m0018|Переназначенные вопросы" },
+      { label: "Дэшборд \"PL ВСП\"", value: "m0094|Дэшборд \"PL ВСП\"" }
+    ]
+  },
+  {
+    label: "Дэшборд \"PL ВСП\"",
+    value: "cat_20_pl_vsp",
+    children: [
+      { label: "Дэшборд \"PL ВСП\"", value: "m0094|Дэшборд \"PL ВСП\"" }
+    ]
+  },
+  {
+    label: "Агрегированные продукты",
+    value: "cat_21_agg",
+    children: [
+      { label: "Куб по Доходным договорам (ежемесячный)", value: "s0002|Куб по Доходным договорам (ежемесячный)" },
+      { label: "Ежемесячный куб по финансовому результату ЦП «Недвижимость» (s0003)", value: "s0003|Ежемесячный куб по финансовому результату ЦП «Недвижимость»" },
+      { label: "Ежемесячный куб данных по финансовому результату ЦП «Недвижимость» (p0069)", value: "p0069|Ежемесячный куб данных по финансовому результату ЦП «Недвижимость»" }
+    ]
+  },
+  {
+    label: "Куб по Доходным договорам (ежемесячный)",
+    value: "cat_22_income",
+    children: [
+      { label: "Куб по Доходным договорам (ежемесячный)", value: "s0002|Куб по Доходным договорам (ежемесячный)" },
+      { label: "Ежемесячный куб по финансовому результату ЦП «Недвижимость»", value: "s0003|Ежемесячный куб по финансовому результату ЦП «Недвижимость»" }
+    ]
+  }
+];
